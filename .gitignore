@@ -1,0 +1,4 @@
+.vscode
+ebm-anatomy/__pycache__/
+ebm-anatomy/data/
+ebm-anatomy/out_data/
