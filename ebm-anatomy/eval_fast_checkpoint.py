@@ -10,12 +10,13 @@ from utilfid import load_mnist_feature_extractor, compute_fid_batch
 # =========================
 # PARAMETRES (EN HAUT)
 # =========================
-EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
-CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
+EXP_DIR = './out_data/Expe/mnist_Lip100_Langevin10_Seed42/'
+CONFIG_FILE = './config_locker/mnist_Lip100_Langevin10_Seed42.json'
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 5000
-
+LONGRUN_STEPS = 1000
+LONGRUN_INIT = 'uniform' 
 
 def sample_image_set(image_set, batch_size):
     rand_inds = t.randperm(image_set.shape[0])[:batch_size]
@@ -89,23 +90,7 @@ feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature
 with t.no_grad():
     x_q_fid = sample_q(q, config['data_epsilon'], FID_BATCH_SIZE)
 
-x_s_t_fid = sample_s_t(
-    f=f,
-    s_t_0=s_t_0,
-    config=config,
-    device=device,
-    L=config['num_shortrun_steps'],
-    init_type=config['shortrun_init'],
-    batch_size=FID_BATCH_SIZE,
-)
-
-fid_big = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor)
-print(f'FID(batch={FID_BATCH_SIZE}) = {fid_big:.6f}')
-
 # -------- compute long-run FID from noise init --------
-LONGRUN_STEPS = config.get('num_longrun_steps', 1000)
-LONGRUN_INIT = 'gaussian'  # ou 'uniform' si tu préfères
-
 x_s_t_longrun = sample_s_t(
     f=f,
     s_t_0=s_t_0,
@@ -125,15 +110,16 @@ df = pd.read_csv(CSV_FILE)
 iters = df['iteration'].to_numpy()
 fids = df['FID'].to_numpy()
 
-idx50 = next(i for i, v in enumerate(fids) if v <= 50)
+# take the first point and the point where FID <= 10
+idxfirst = 0
 idx10 = next(i for i, v in enumerate(fids) if v <= 10)
 
-x1, y1 = float(iters[idx50]), float(fids[idx50])
+x1, y1 = float(iters[idxfirst]), float(fids[idxfirst])
 x2, y2 = float(iters[idx10]), float(fids[idx10])
 
 a = (y2 - y1) / (x2 - x1)
 b = y1 - a * x1
 
-print(f'Point FID<=50: iter={x1:.0f}, fid={y1:.6f}')
+print(f'First point: iter={x1:.0f}, fid={y1:.6f}')
 print(f'Point FID<=10: iter={x2:.0f}, fid={y2:.6f}')
 print(f'Droite: f(x) = a*x + b avec a={a:.8f}, b={b:.8f}')
