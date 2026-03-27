@@ -70,6 +70,14 @@ checkpoint = t.load(CHECKPOINT_FILE, map_location=device)
 f.load_state_dict(checkpoint['model_state_dict'])
 f.eval()
 s_t_0 = checkpoint['s_t_0'].to(device)
+seed = checkpoint.get('seed', 42)
+t.manual_seed(config['seed'])
+if t.cuda.is_available():
+    t.cuda.manual_seed_all(config['seed'])
+import random
+import numpy as np
+np.random.seed(config['seed'])
+random.seed(config['seed'])
 
 # -------- load data --------
 data = {
