@@ -17,15 +17,18 @@ from utils import plot_ims
 EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
 CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
 CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
-LONGRUN_STEPS = 100
-BATCH_SIZE = 1
-SEED = 42
+LONGRUN_STEPS = 500000
+BATCH_SIZE = 100
+SEED = 2
 #######################
 # ## INITIAL SETUP ## #
 #######################
 
 with open(CONFIG_FILE) as file:
     config = json.load(file)
+
+# temperature from training
+temp = 1 * (config['epsilon'] ** 2) / 2
 
 t.manual_seed(SEED)
 if t.cuda.is_available():
@@ -62,59 +65,99 @@ if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
     f.load_state_dict(checkpoint['model_state_dict'])
 else:
     f.load_state_dict(checkpoint)
+f.to(device)
 f.eval()
 
 
 ############################################
 # ## INIT PERSISTENT FROM MNIST (always) ## #
 ############################################
+def langevin_grad(f, x_s_t_0_l, config, temp_l):
+    x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
-transform = tr.Compose([
-    tr.Resize(config['im_sz']),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    tr.Normalize(tuple(0.5 * t.ones(config['im_ch'])), tuple(0.5 * t.ones(config['im_ch']))),
-])
+    # sampling records
+    grads = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
+    ens = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
 
-mnist_data = datasets.MNIST(root='./data/mnist', transform=transform, download=True)
+    # iterative langevin updates of MCMC samples
+    for ell in range(LONGRUN_STEPS):
+        en = f(x_s_t_l) / temp_l
+        ens[ell] = en.detach().cpu()
+        grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
+        if config['epsilon'] > 0:
+            x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
+            grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        else:
+            x_s_t_l.data += - grad
+            grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        if ell == 0 or (ell + 1) % config['log_freq'] == 0 or (ell + 1) == LONGRUN_STEPS:
+            print('Step {} of {}.   Ave. En={:>14.9f}   Ave. Grad={:>14.9f}'.
+                  format(ell+1, LONGRUN_STEPS, ens[ell].mean(), grads[ell].mean()), end='\r')
+    return x_s_t_l.detach(), ens, grads
 
-q = t.stack([x[0] for x in mnist_data]).to(device)
+# langevin equation with MH adjustment
+def langevin_mh(f, x_s_t_0_l, config, temp_l):
+    x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
-s_t_0 = 2 * t.rand_like(q) - 1
+    # sampling records
+    ens = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
+    grads = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
+    accepts = t.zeros(LONGRUN_STEPS)
+
+    # iterative langevin updates of MCMC samples
+    for ell in range(LONGRUN_STEPS):
+        # get energy and gradient of current states
+        en = f(x_s_t_l) / temp_l
+        ens[ell] = en.detach().cpu()
+        grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
+        grads[ell] = ((config['epsilon'] ** 2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+
+        # get initial gaussian momenta
+        p = t.randn_like(x_s_t_l)
+
+        # get proposal states
+        x_prop = x_s_t_l - ((config['epsilon'] ** 2)/2) * grad + config['epsilon'] * p
+        # update momentum
+        en_prop = f(x_prop) / temp_l
+        grad_prop = t.autograd.grad(en_prop.sum(), [x_prop])[0]
+        p_prop = p - (config['epsilon'] / 2) * (grad + grad_prop)
+
+        # joint energy of states and auxiliary momentum variables
+        joint_en_orig = en + 0.5 * t.sum((p ** 2).view(x_s_t_l.shape[0], -1), 1)
+        joint_en_prop = en_prop + 0.5 * t.sum((p_prop ** 2).view(x_s_t_l.shape[0], -1), 1)
+
+        # accept or reject states_prop using MH acceptance ratio
+        accepted_proposals = t.rand_like(en) < t.exp(joint_en_orig - joint_en_prop)
+
+        # update only states with accepted proposals
+        x_s_t_l.data[accepted_proposals] = x_prop.data[accepted_proposals]
+        accepts[ell] = float(accepted_proposals.sum().cpu()) / float(BATCH_SIZE)
+
+        if ell == 0 or (ell + 1) % config['log_freq'] == 0 or (ell + 1) == LONGRUN_STEPS:
+            print('Step {} of {}.   Ave. En={:>14.9f}   Ave. Grad={:>14.9f}   Accept Rate={:>14.9f}'.
+                  format(ell+1, LONGRUN_STEPS, ens[ell].mean(), grads[ell].mean(), accepts[ell]), end='\r')
+
+    return x_s_t_l.detach(), ens, grads, accepts
 
 
 def sample_image_set(image_set, batch_size):
     rand_inds = t.randperm(image_set.shape[0])[:batch_size]
     return image_set[rand_inds]
 
-
-def sample_q(q, data_epsilon, batch_size):
-    x_q = sample_image_set(q, batch_size=batch_size)
-    return x_q + data_epsilon * t.randn_like(x_q)
-
-
-def sample_s_t(f, s_t_0, config, device, L, init_type, batch_size):
-    if init_type == 'persistent':
-        rand_inds = t.randperm(s_t_0.shape[0])[:batch_size]
-        x_s_t_0 = s_t_0[rand_inds]
-    elif init_type == 'data':
-        x_s_t_0 = sample_q(q, config['data_epsilon'], batch_size)
-    elif init_type == 'uniform':
-        x_s_t_0 = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
+def sample_s_t(f, config, device, L, init_type, batch_size):
+    if init_type == 'uniform':
+        x_s_t_0 = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']])).to(device) - 1
     elif init_type == 'gaussian':
         x_s_t_0 = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
 
-    x_s_t = x_s_t_0.clone()
-    for _ in range(L):
-        print(f'Long-run sampling step {_+1}/{L}', end='\r')
-        x_s_t = x_s_t.detach().requires_grad_(True)
-        f_prime = t.autograd.grad(f(x_s_t).sum(), [x_s_t])[0]
-        x_s_t = x_s_t + (-f_prime + config['epsilon'] * t.randn_like(x_s_t))
+    x_s_t = x_s_t_0[t.randperm(x_s_t_0.shape[0])[0:batch_size]]
+
+    x_s_t = langevin_grad(f, x_s_t, config, temp)[0]
+        
 
     return x_s_t.detach()
 
-rand_inds = t.randperm(s_t_0.shape[0])[0:BATCH_SIZE]
-x_s_t = sample_s_t(f, s_t_0, config, device, LONGRUN_STEPS, 'persistent', BATCH_SIZE)
+x_s_t = sample_s_t(f, config, device, LONGRUN_STEPS, 'uniform', BATCH_SIZE)
 
 #########################
 # ## LONGRUN SAMPLING ## #
