@@ -14,10 +14,10 @@ from utils import plot_ims
 # ## PARAMS (like train_data) ## #
 ##################################
 
-EXP_DIR = './out_data/Expe/mnist_Lip0.5_Langevin10_Seed42/'
-CONFIG_FILE = './config_locker/mnist_Lip0.5_Langevin10_Seed42.json'
+EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
+CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
 CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
-LONGRUN_STEPS = 10000
+LONGRUN_STEPS = 300000
 BATCH_SIZE = 1
 SEED = 42
 #######################
@@ -27,11 +27,11 @@ SEED = 42
 with open(CONFIG_FILE) as file:
     config = json.load(file)
 
-t.manual_seed(config['seed'])
+t.manual_seed(SEED)
 if t.cuda.is_available():
-    t.cuda.manual_seed_all(config['seed'])
-np.random.seed(config['seed'])
-random.seed(config['seed'])
+    t.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
 OUT_DIR = EXP_DIR + 'longrun/'
@@ -113,17 +113,12 @@ def sample_s_t(f, s_t_0, config, device, L, init_type, batch_size):
 
     return x_s_t.detach()
 
-
-
-
-
 rand_inds = t.randperm(s_t_0.shape[0])[0:BATCH_SIZE]
-x_s_t = sample_s_t(f, s_t_0, config, device, LONGRUN_STEPS, 'persistent', BATCH_SIZE)
+x_s_t = sample_s_t(f, s_t_0, config, device, LONGRUN_STEPS, 'gaussian', BATCH_SIZE)
 
 #########################
 # ## LONGRUN SAMPLING ## #
 #########################
-
 
 x_longrun = x_s_t.detach()
 plot_ims(OUT_DIR + 'longrun.png', x_longrun)
