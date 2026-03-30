@@ -8,7 +8,6 @@ import torchvision.datasets as datasets
 import json
 import os
 import csv
-import argparse
 import numpy as np
 import random
 from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip
@@ -29,44 +28,20 @@ CONFIG_FILE = './config_locker/mnist_Lip10_Langevin10_Seed42.json'
 with open(CONFIG_FILE) as file:
     config = json.load(file)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--resume-checkpoint', type=str, default=None,
-                    help='Path to full checkpoint file (.pth) to resume from.')
-args = parser.parse_args()
-
-
-def resolve_resume_checkpoint():
-    if args.resume_checkpoint is None:
-        return None
-    checkpoint_path = args.resume_checkpoint
-    if not os.path.isabs(checkpoint_path):
-        checkpoint_path = os.path.join(EXP_DIR, checkpoint_path)
-    return checkpoint_path
-
-
-resume_checkpoint_path = resolve_resume_checkpoint()
-resume_mode = resume_checkpoint_path is not None
-
 # make directory for saving results
 if os.path.exists(EXP_DIR):
-    if resume_mode:
+    # prevents overwriting old experiment folders by accident
+    choice = input('Experiment folder "{}" already exists. Do you want to overwrite it? (y/n) '.format(EXP_DIR))
+    if choice.lower() == 'y':
+        import shutil
+        shutil.rmtree(EXP_DIR)
+        os.makedirs(EXP_DIR)
         for folder in ['checkpoints', 'shortrun', 'longrun', 'plots', 'code']:
-            os.makedirs(EXP_DIR + folder, exist_ok=True)
-    else :
-        # prevents overwriting old experiment folders by accident
-        choice = input('Experiment folder "{}" already exists. Do you want to overwrite it? (y/n) '.format(EXP_DIR))
-        if choice.lower() == 'y':
-            import shutil
-            shutil.rmtree(EXP_DIR)
-            os.makedirs(EXP_DIR)
-            for folder in ['checkpoints', 'shortrun', 'longrun', 'plots', 'code']:
-                os.mkdir(EXP_DIR + folder)
+            os.mkdir(EXP_DIR + folder)
 
-        else :
-            raise RuntimeError('Folder "{}" already exists. Please use a different "EXP_DIR".'.format(EXP_DIR))
+    else :
+        raise RuntimeError('Folder "{}" already exists. Please use a different "EXP_DIR".'.format(EXP_DIR))
 else:
-    if resume_mode:
-        raise RuntimeError('Cannot resume training: experiment folder does not exist: {}'.format(EXP_DIR))
     os.makedirs(EXP_DIR)
     for folder in ['checkpoints', 'shortrun', 'longrun', 'plots', 'code']:
         os.mkdir(EXP_DIR + folder)
@@ -119,24 +94,6 @@ if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0:
     config['lr_init'] *= (config['epsilon'] ** 2) / 2
     config['lr_min'] *= (config['epsilon'] ** 2) / 2
 optim = optim_bank[config['optimizer_type']](f.parameters(), lr=config['lr_init'])
-
-if resume_mode:
-    if not os.path.exists(resume_checkpoint_path):
-        raise RuntimeError('Checkpoint file not found: {}'.format(resume_checkpoint_path))
-
-    loaded_checkpoint = t.load(resume_checkpoint_path, map_location=device)
-    if isinstance(loaded_checkpoint, dict) and ('model_state_dict' in loaded_checkpoint):
-        f.load_state_dict(loaded_checkpoint['model_state_dict'])
-        optim.load_state_dict(loaded_checkpoint['optimizer_state_dict'])
-        start_iter = int(loaded_checkpoint.get('iter', 0))
-    else :
-        raise RuntimeError('Invalid checkpoint format: expected a dictionary with keys "model_state_dict" and "optimizer_state_dict".')
-    if start_iter >= config['num_train_iters']:
-        raise RuntimeError('start_iter ({}) >= num_train_iters ({}). Nothing to resume.'.format(
-            start_iter, config['num_train_iters']))
-
-    print('Resuming from checkpoint: {}'.format(resume_checkpoint_path))
-    print('Training will continue at iteration {:d}'.format(start_iter + 1))
 
 print('Processing data...')
 # make tensor of training data
