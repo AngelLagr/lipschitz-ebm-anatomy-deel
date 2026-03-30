@@ -14,12 +14,12 @@ from utils import plot_ims
 # ## PARAMS (like train_data) ## #
 ##################################
 
-EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
-CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
-CHECKPOINT_PATH = EXP_DIR + 'checkpoints/ckpt_006200.pth'
-LOG_FREQ = 100
-
-
+EXP_DIR = './out_data/Expe/mnist_Lip0.5_Langevin10_Seed42/'
+CONFIG_FILE = './config_locker/mnist_Lip0.5_Langevin10_Seed42.json'
+CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
+LONGRUN_STEPS = 10000
+BATCH_SIZE = 1
+SEED = 42
 #######################
 # ## INITIAL SETUP ## #
 #######################
@@ -77,37 +77,54 @@ transform = tr.Compose([
 ])
 
 mnist_data = datasets.MNIST(root='./data/mnist', transform=transform, download=True)
+
 q = t.stack([x[0] for x in mnist_data]).to(device)
 
-if isinstance(checkpoint, dict) and ('s_t_0' in checkpoint):
-    s_t_0 = checkpoint['s_t_0'].to(device)
-else:
-    s_t_0 = q.clone()
+s_t_0 = 2 * t.rand_like(q) - 1
 
-rand_inds = t.randperm(s_t_0.shape[0])[0:config['batch_size']]
-x_s_t = t.autograd.Variable(s_t_0[rand_inds].clone(), requires_grad=True)
 
+def sample_image_set(image_set, batch_size):
+    rand_inds = t.randperm(image_set.shape[0])[:batch_size]
+    return image_set[rand_inds]
+
+
+def sample_q(q, data_epsilon, batch_size):
+    x_q = sample_image_set(q, batch_size=batch_size)
+    return x_q + data_epsilon * t.randn_like(x_q)
+
+
+def sample_s_t(f, s_t_0, config, device, L, init_type, batch_size):
+    if init_type == 'persistent':
+        rand_inds = t.randperm(s_t_0.shape[0])[:batch_size]
+        x_s_t_0 = s_t_0[rand_inds]
+    elif init_type == 'data':
+        x_s_t_0 = sample_q(q, config['data_epsilon'], batch_size)
+    elif init_type == 'uniform':
+        x_s_t_0 = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
+    elif init_type == 'gaussian':
+        x_s_t_0 = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
+
+    x_s_t = x_s_t_0.clone()
+    for _ in range(L):
+        print(f'Long-run sampling step {_+1}/{L}', end='\r')
+        x_s_t = x_s_t.detach().requires_grad_(True)
+        f_prime = t.autograd.grad(f(x_s_t).sum(), [x_s_t])[0]
+        x_s_t = x_s_t + (-f_prime + config['epsilon'] * t.randn_like(x_s_t))
+
+    return x_s_t.detach()
+
+
+
+
+
+rand_inds = t.randperm(s_t_0.shape[0])[0:BATCH_SIZE]
+x_s_t = sample_s_t(f, s_t_0, config, device, LONGRUN_STEPS, 'persistent', BATCH_SIZE)
 
 #########################
 # ## LONGRUN SAMPLING ## #
 #########################
 
-plot_ims(OUT_DIR + 'initial_states.png', x_s_t)
-
-for ell in range(config['num_longrun_steps']):
-    f_prime = t.autograd.grad(f(x_s_t).sum(), [x_s_t])[0]
-    x_s_t.data += -f_prime + config['epsilon'] * t.randn_like(x_s_t)
-
-    if ell == 0 or (ell + 1) % LOG_FREQ == 0 or (ell + 1) == config['num_longrun_steps']:
-        print('Step {} / {}   mean|grad|={:>14.9f}'.format(
-            ell + 1,
-            config['num_longrun_steps'],
-            f_prime.view(f_prime.shape[0], -1).norm(dim=1).mean()
-        ))
 
 x_longrun = x_s_t.detach()
-
-plot_ims(OUT_DIR + 'longrun_last.png', x_longrun)
-t.save(x_longrun.cpu(), OUT_DIR + 'longrun_last_tensor.pth')
-
+plot_ims(OUT_DIR + 'longrun.png', x_longrun)
 print('Saved longrun in: {}'.format(OUT_DIR))

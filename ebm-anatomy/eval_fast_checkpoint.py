@@ -3,19 +3,25 @@ import torch as t
 import torchvision.transforms as tr
 import torchvision.datasets as datasets
 import pandas as pd
-
+from utils import*
 from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # =========================
 # PARAMETRES (EN HAUT)
 # =========================
-EXP_DIR = './out_data/Expe/mnist_Lip100_Langevin10_Seed42/'
-CONFIG_FILE = './config_locker/mnist_Lip100_Langevin10_Seed42.json'
+# parse the args and set up experiment directory
+args = argparse.ArgumentParser()
+args.add_argument('--LipConstant', type=int, default=None)
+args.add_argument('--LangevinSteps', type=int, default=None)
+
+
+EXP_DIR = './out_data/Expe/mnist_Lip{}_Langevin{}_Seed42/'.format(args.LipConstant, args.LangevinSteps)
+CONFIG_FILE = './config_locker/mnist_Lip{}_Langevin{}_Seed42.json'.format(args.LipConstant, args.LangevinSteps)
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
-FID_BATCH_SIZE = 5000
-LONGRUN_STEPS = 1000
+FID_BATCH_SIZE = 10000
+LONGRUN_STEPS = 100000
 LONGRUN_INIT = 'uniform' 
 
 def sample_image_set(image_set, batch_size):
@@ -41,6 +47,7 @@ def sample_s_t(f, s_t_0, config, device, L, init_type, batch_size):
 
     x_s_t = t.autograd.Variable(x_s_t_0.clone(), requires_grad=True)
     for _ in range(L):
+        print(f'Long-run sampling step {_+1}/{L}', end='\r')
         f_prime = t.autograd.grad(f(x_s_t).sum(), [x_s_t])[0]
         x_s_t.data += -f_prime + config['epsilon'] * t.randn_like(x_s_t)
 
@@ -108,6 +115,12 @@ x_s_t_longrun = sample_s_t(
     init_type=LONGRUN_INIT,
     batch_size=FID_BATCH_SIZE,
 )
+
+#save a litle part of the long-run image for visualisation
+x_s_t_longrun_vis = x_s_t_longrun[:16]
+plot_ims(EXP_DIR + 'longrun/' + 'longrun_sample.png', x_s_t_longrun_vis)
+
+
 
 fid_longrun = compute_fid_batch(x_q_fid, x_s_t_longrun, feature_extractor)
 print(f'FID_longrun_from_noise(batch={FID_BATCH_SIZE}, L={LONGRUN_STEPS}, init={LONGRUN_INIT}) = {fid_longrun:.6f}')
