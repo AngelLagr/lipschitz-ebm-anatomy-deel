@@ -17,9 +17,11 @@ from utils import plot_ims
 EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
 CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
 CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
-LONGRUN_STEPS = 500000
-BATCH_SIZE = 100
-SEED = 2
+LONGRUN_STEPS = 100000
+BATCH_SIZE = 9
+SEED = 42
+EPSILON = (7.5e-3)
+
 #######################
 # ## INITIAL SETUP ## #
 #######################
@@ -28,8 +30,8 @@ with open(CONFIG_FILE) as file:
     config = json.load(file)
 
 # temperature from training
-temp = 1 * (config['epsilon'] ** 2) / 2
-
+temp = 1 * (EPSILON ** 2) / 2
+#temp=1
 t.manual_seed(SEED)
 if t.cuda.is_available():
     t.cuda.manual_seed_all(SEED)
@@ -65,6 +67,8 @@ if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
     f.load_state_dict(checkpoint['model_state_dict'])
 else:
     f.load_state_dict(checkpoint)
+
+
 f.to(device)
 f.eval()
 
@@ -84,9 +88,11 @@ def langevin_grad(f, x_s_t_0_l, config, temp_l):
         en = f(x_s_t_l) / temp_l
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
-        if config['epsilon'] > 0:
-            x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
-            grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        if EPSILON > 0:
+            x_s_t_l.data += - ((EPSILON**2)/2) * grad + EPSILON * t.randn_like(x_s_t_l)
+            grads[ell] = ((EPSILON**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+            #x_s_t_l.data += - grad + EPSILON * t.randn_like(x_s_t_l)
+            #grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
         else:
             x_s_t_l.data += - grad
             grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
@@ -110,17 +116,17 @@ def langevin_mh(f, x_s_t_0_l, config, temp_l):
         en = f(x_s_t_l) / temp_l
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
-        grads[ell] = ((config['epsilon'] ** 2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        grads[ell] = ((EPSILON ** 2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
 
         # get initial gaussian momenta
         p = t.randn_like(x_s_t_l)
 
         # get proposal states
-        x_prop = x_s_t_l - ((config['epsilon'] ** 2)/2) * grad + config['epsilon'] * p
+        x_prop = x_s_t_l - ((EPSILON ** 2)/2) * grad + EPSILON * p
         # update momentum
         en_prop = f(x_prop) / temp_l
         grad_prop = t.autograd.grad(en_prop.sum(), [x_prop])[0]
-        p_prop = p - (config['epsilon'] / 2) * (grad + grad_prop)
+        p_prop = p - (EPSILON / 2) * (grad + grad_prop)
 
         # joint energy of states and auxiliary momentum variables
         joint_en_orig = en + 0.5 * t.sum((p ** 2).view(x_s_t_l.shape[0], -1), 1)

@@ -15,9 +15,9 @@ from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin10_Seed42/'
+EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
 # json file with experiment config
-CONFIG_FILE = './config_locker/mnist_Lip10_Langevin10_Seed42.json'
+CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
 
 
 #######################
@@ -134,7 +134,15 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     # get initial mcmc states for langevin updates ("persistent", "data", "uniform", or "gaussian")
     def sample_s_t_0():
         if init_type == 'persistent':
-            return sample_image_set(s_t_0,batch_size=batch_size)
+            # 95% chance each sample comes from s_t_0, 5% chance from uniform random noise
+            mask = t.rand(batch_size) < 0.95
+            indices = t.randperm(s_t_0.shape[0])[:batch_size]
+            persistent_samples = s_t_0[indices]
+            random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device) - 1
+            x_s_t_0 = t.where(mask.view(-1, 1, 1, 1).to(device), persistent_samples, random_samples)
+            sample_inds = indices.clone()
+            #sample_inds[~mask] = -1 # mark non-persistent samples with -1 since they won't be used to update s_t_0
+            return x_s_t_0, sample_inds
         elif init_type == 'data':
             return sample_q(batch_size=batch_size), None
         elif init_type == 'uniform':
@@ -267,6 +275,7 @@ for i in range(start_iter, config['num_train_iters']):
         x_q_fid = sample_q(batch_size = fid_batch_size)
         x_s_t_fid, _ = sample_s_t(L=config['num_shortrun_steps'], init_type=config['shortrun_init'], update_s_t_0=False, batch_size = fid_batch_size)
         fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor)
+        if fid_score > 100 : fid_score = 100 # cap FID at 100 for better visualization of training progress
         fid_record[i] = t.tensor(fid_score).to(device)
 
     # anneal learning rate

@@ -6,7 +6,6 @@ import torchvision.transforms as transforms
 
 from utilfid import SimpleFeatureExtractor
 
-
 class MNISTClassifier(nn.Module):
     def __init__(self, device):
         super(MNISTClassifier, self).__init__()
@@ -30,7 +29,16 @@ def main():
     optimizer = t.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
-    train_set = datasets.MNIST(root='./data/mnist', train=True, download=True, transform=transforms.ToTensor())
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))  # [0,1] -> [-1,1]
+    ])
+    train_set = datasets.MNIST(
+        root='./data/mnist',
+        train=True,
+        download=True,
+        transform=transform
+    )
     train_loader = t.utils.data.DataLoader(train_set, batch_size=128, shuffle=True)
 
     epochs = 50
