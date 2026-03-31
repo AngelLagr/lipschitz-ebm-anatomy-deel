@@ -45,8 +45,8 @@ def langevin_grad(f, x_s_t_0_l, config, temp_l):
     x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
     # sampling records
-    grads = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
-    ens = t.zeros(LONGRUN_STEPS, BATCH_SIZE)
+    grads = t.zeros(LONGRUN_STEPS, FID_BATCH_SIZE)
+    ens = t.zeros(LONGRUN_STEPS, FID_BATCH_SIZE)
 
     # iterative langevin updates of MCMC samples
     for ell in range(LONGRUN_STEPS):
@@ -127,7 +127,7 @@ def sample_s_t(f, config, device, L, init_type, batch_size):
 
     x_s_t = x_s_t_0.clone()
     
-    x_s_t = langevin_mh(f, x_s_t, config, temp)[0]
+    x_s_t = langevin_grad(f, x_s_t, config, temp)[0]
         
 
     return x_s_t.detach()
