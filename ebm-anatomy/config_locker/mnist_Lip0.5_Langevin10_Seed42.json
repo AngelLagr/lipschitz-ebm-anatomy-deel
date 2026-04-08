@@ -2,7 +2,7 @@
   "_comment": "===== EXPERIMENT PARAMETERS =====",
   "_comment": "data should use one of the following: flowers, mnist, cifar10",
   "data": "mnist",
-  "num_train_iters": 1000000,
+  "num_train_iters": 2000000,
   "batch_size": 100,
   "seed": 42,
   "_comment": "===== IMAGE DATA PARAMETERS =====",
@@ -27,7 +27,7 @@
   "log_freq": 10000,
   "log_longrun": false,
   "log_longrun_freq": 5000,
-  "num_longrun_steps": 10000,
+  "num_longrun_steps": 1000,
   "_comment": "longrun_init should use one of the following: persistent, data, uniform, gaussian",
   "longrun_init": "data"
 }

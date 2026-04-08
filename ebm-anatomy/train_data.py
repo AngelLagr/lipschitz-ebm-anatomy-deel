@@ -10,14 +10,14 @@ import os
 import csv
 import numpy as np
 import random
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2
 from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
+EXP_DIR = './out_data/Expe/mnist_Lip1to40_Langevin10_Seed42SGD/'
 # json file with experiment config
-CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
+CONFIG_FILE = './config_locker/mnist_Lip_Langevin10_Seed42Monitor.json'
 
 
 #######################
@@ -81,14 +81,27 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip}
-if config['net_type'] == "vanillaLip":
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2}
+if config['net_type'] in ("vanillaLip", "vanillaLip2"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
 else :
     f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
 
+lip_schedule_enabled = config.get('increase_lip_const', False)
+lip_const_start = float(config.get('Lip_const', 10.0))
+lip_const_step = float(config.get('Lip_const_step', 0.5))
+lip_const_max = float(config.get('Lip_const_max', 500.0))
+
+
+def update_lip_const(iteration_idx):
+    if not lip_schedule_enabled or not hasattr(f, 'Lip_const'):
+        return None
+    current_lip_const = min(lip_const_max, lip_const_start + lip_const_step * iteration_idx)
+    f.Lip_const = current_lip_const
+    return current_lip_const
+
 # set up optimizer
-optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD}
+optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
 if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0:
     # scale learning rate according to langevin noise for invariant tuning
     config['lr_init'] *= (config['epsilon'] ** 2) / 2
@@ -134,12 +147,12 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     # get initial mcmc states for langevin updates ("persistent", "data", "uniform", or "gaussian")
     def sample_s_t_0():
         if init_type == 'persistent':
-            # 95% chance each sample comes from s_t_0, 5% chance from uniform random noise
-            mask = t.rand(batch_size) < 0.95
-            indices = t.randperm(s_t_0.shape[0])[:batch_size]
+            # 99% chance each sample comes from s_t_0, 1% chance from uniform random noise
+            mask = t.rand(batch_size, device=device) < 0.97
+            indices = t.randperm(s_t_0.shape[0], device=device)[:batch_size]
             persistent_samples = s_t_0[indices]
-            random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device) - 1
-            x_s_t_0 = t.where(mask.view(-1, 1, 1, 1).to(device), persistent_samples, random_samples)
+            random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
+            x_s_t_0 = t.where(mask.view(-1, 1, 1, 1), persistent_samples, random_samples)
             sample_inds = indices.clone()
             #sample_inds[~mask] = -1 # mark non-persistent samples with -1 since they won't be used to update s_t_0
             return x_s_t_0, sample_inds
@@ -170,6 +183,38 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
         s_t_0.data[s_t_0_inds] = x_s_t.detach().data.clone()
 
     return x_s_t.detach(), r_s_t.squeeze() / L
+
+
+#Longrun functions
+def langevin_grad(f, x_s_t_0_l, config,temp,batch_size):
+    x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
+
+    # sampling records
+    grads = t.zeros(config['num_longrun_steps'], batch_size)
+    ens = t.zeros(config['num_longrun_steps'], batch_size)
+
+    # iterative langevin updates of MCMC samples
+    for ell in range(config['num_longrun_steps']):
+        en = f(x_s_t_l) / temp
+        ens[ell] = en.detach().cpu()
+        grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
+        x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
+        grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+
+    return x_s_t_l.detach(), ens, grads
+
+def sample_s_tlongrun(f, config, device, init_type, batch_size):
+    if init_type == 'uniform':
+        x_s_t_0_l = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
+    elif init_type == 'gaussian':
+        x_s_t_0_l = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
+
+    x_s_t_l = x_s_t_0_l.clone()
+    
+    x_s_t_l = langevin_grad(f, x_s_t_l, config, (config['epsilon'] ** 2) / 2, batch_size)[0]
+        
+
+    return x_s_t_l.detach()
 
 
 #######################
@@ -239,6 +284,8 @@ def compute_instability_index(i):
 
 print('Training has started.')
 for i in range(start_iter, config['num_train_iters']):
+    current_lip_const = update_lip_const(i)
+
     # obtain positive and negative samples
     x_q = sample_q()
     x_s_t, r_s_t = sample_s_t(L=config['num_shortrun_steps'], init_type=config['shortrun_init'])
@@ -271,9 +318,9 @@ for i in range(start_iter, config['num_train_iters']):
     # compute FID if available
     if feature_extractor is not None and (i == 0 or (i + 1) % config.get('log_freq', 100) == 0):
         # use a bigger batch size for more stable FID estimation if possible
-        fid_batch_size = 1000
+        fid_batch_size = 3000
         x_q_fid = sample_q(batch_size = fid_batch_size)
-        x_s_t_fid, _ = sample_s_t(L=config['num_shortrun_steps'], init_type=config['shortrun_init'], update_s_t_0=False, batch_size = fid_batch_size)
+        x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='uniform', batch_size = fid_batch_size)
         fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor)
         if fid_score > 100 : fid_score = 100 # cap FID at 100 for better visualization of training progress
         fid_record[i] = t.tensor(fid_score).to(device)
@@ -285,6 +332,8 @@ for i in range(start_iter, config['num_train_iters']):
     # print and save learning info
     print('{:>6d}   d_s_t={:>14.9f}   r_s_t={:>14.9f}   instability={:>14.9f} fid={:>14.9f}'.format(
         i+1, d_s_t.detach().data, r_s_t, instability_record[i], fid_score))
+    if current_lip_const is not None:
+        print('{:>6d}   Lip_const={:>14.9f}'.format(i+1, current_lip_const))
 
     if ((i + 1) % config['log_freq'] == 0) or ((i + 1) == config['num_train_iters']):
         csv_exists = os.path.exists(csv_file_path)

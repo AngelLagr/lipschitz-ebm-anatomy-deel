@@ -5,7 +5,7 @@ import torchvision.datasets as datasets
 import pandas as pd
 import argparse
 from utils import*
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # =========================
@@ -13,18 +13,15 @@ from utilfid import load_mnist_feature_extractor, compute_fid_batch
 # =========================
 # parse the args and set up experiment directory
 
-args = argparse.ArgumentParser()
-args.add_argument('--LipConstant', type=int, default=None)
-args.add_argument('--LangevinSteps', type=int, default=None)
-args = args.parse_args()
-EXP_DIR = './out_data/Expe/mnist_Lip{}_Langevin{}_Seed42/'.format(args.LipConstant, args.LangevinSteps)
-CONFIG_FILE = './config_locker/mnist_Lip{}_Langevin{}_Seed42.json'.format(args.LipConstant, args.LangevinSteps)
-CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
-CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
-FID_BATCH_SIZE = 1000
-LONGRUN_STEPS = 10000
-LONGRUN_INIT = 'uniform' 
 
+EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin10_Seed42sgd/'
+CONFIG_FILE = './config_locker/mnist_Lip10_Langevin10_Seed42.json'
+CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_032000.pth'
+CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
+FID_BATCH_SIZE = 3000
+LONGRUN_STEPS = 1000
+LONGRUN_INIT = 'uniform' 
+SEED = 42
 # -------- load config/device --------
 with open(CONFIG_FILE) as file:
     config = json.load(file)
@@ -59,7 +56,7 @@ def langevin_grad(f, x_s_t_0_l, config, temp_l):
         else:
             x_s_t_l.data += - grad
             grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
-        if ell == 0 or (ell + 1) % config['log_freq'] == 0 or (ell + 1) == LONGRUN_STEPS:
+        if ell == 0 or (ell + 1) % 10 == 0 or (ell + 1) == LONGRUN_STEPS:
             print('Step {} of {}.   Ave. En={:>14.9f}   Ave. Grad={:>14.9f}'.
                   format(ell+1, LONGRUN_STEPS, ens[ell].mean(), grads[ell].mean()), end='\r')
     return x_s_t_l.detach(), ens, grads
@@ -140,6 +137,7 @@ net_bank = {
     'vanillaLip': VanillaNetLLip,
     'nonlocal': NonlocalNet,
     'vanillaHalfLip': VanillaNetHalfLip,
+    'vanillaLip2': VanillaNetLLip2,
 }
 if config['net_type'] == 'vanillaLip':
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
@@ -148,17 +146,21 @@ else:
 
 # -------- load checkpoint --------
 checkpoint = t.load(CHECKPOINT_FILE, map_location=device)
-f.load_state_dict(checkpoint['model_state_dict'])
+if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+    f.load_state_dict(checkpoint['model_state_dict'])
+else:
+    f.load_state_dict(checkpoint)
+
 f.eval()
 f.to(device)
-seed = checkpoint.get('seed', 42)
-t.manual_seed(config['seed'])
+seed = SEED
+t.manual_seed(SEED)
 if t.cuda.is_available():
-    t.cuda.manual_seed_all(config['seed'])
+    t.cuda.manual_seed_all(SEED)
 import random
 import numpy as np
-np.random.seed(config['seed'])
-random.seed(config['seed'])
+np.random.seed(SEED)
+random.seed(SEED)
 
 # -------- load data --------
 data = {
@@ -194,7 +196,7 @@ x_s_t_longrun = sample_s_t(
 #save a litle part of the long-run image for visualisation
 x_s_t_longrun_vis = x_s_t_longrun[:16]
 plot_ims(EXP_DIR + 'longrun/' + 'longrun_sample.png', x_s_t_longrun_vis)
-
+plot_ims(EXP_DIR + 'longrun/' + 'q_sample.png', x_q_fid[:16])
 
 
 fid_longrun = compute_fid_batch(x_q_fid, x_s_t_longrun, feature_extractor)

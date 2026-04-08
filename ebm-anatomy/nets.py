@@ -103,7 +103,25 @@ class VanillaNetHalfLip(nn.Module):
 
     def forward(self, x):
         return self.f(x).squeeze()
-    
+        
+class VanillaNetLLip2(nn.Module):
+    def __init__(self, n_c=3, n_f=32, leak=0.05, Lip_const=10):
+        super(VanillaNetLLip2, self).__init__()
+        self.Lip_const = Lip_const
+        self.f = nn.Sequential(
+            torchlip.SpectralConv2d(n_c, n_f, 3, 1, 1),
+            torchlip.GroupSort2(),
+            torchlip.SpectralConv2d(n_f, n_f * 2, 5, 2, 2),
+            torchlip.GroupSort2(),
+            torchlip.SpectralConv2d(n_f*2, n_f*4, 5, 2, 2),
+            torchlip.GroupSort2(),
+            torchlip.SpectralConv2d(n_f*4, n_f*8, 5, 2, 2),
+            torchlip.GroupSort2(),
+            torchlip.SpectralConv2d(n_f*8, 1, 4, 1, 0))
+
+    def forward(self, x):
+        return self.Lip_const * self.f(x).squeeze()
+
 class VanillaNetLLip(nn.Module):
     def __init__(self, n_c=3, n_f=32, leak=0.05, Lip_const=10):
         super(VanillaNetLLip, self).__init__()

@@ -14,10 +14,10 @@ from utils import plot_ims
 # ## PARAMS (like train_data) ## #
 ##################################
 
-EXP_DIR = './out_data/Expe/mnist_Lip0_Langevin100_Seed42/'
-CONFIG_FILE = './config_locker/mnist_Lip0_Langevin100_Seed42.json'
-CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
-LONGRUN_STEPS = 100000
+EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin10_Seed42/'
+CONFIG_FILE = './config_locker/mnist_Lip10_Langevin10_Seed42.json'
+CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint40k.pth'
+LONGRUN_STEPS = 1500
 BATCH_SIZE = 9
 SEED = 42
 EPSILON = (7.5e-3)
