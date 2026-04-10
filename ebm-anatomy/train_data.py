@@ -10,14 +10,14 @@ import os
 import csv
 import numpy as np
 import random
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2
 from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip1to40_Langevin10_Seed42SGD/'
+EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin100_Seed42SGD/'
 # json file with experiment config
-CONFIG_FILE = './config_locker/mnist_Lip_Langevin10_Seed42Monitor.json'
+CONFIG_FILE = './config_locker/mnist_Lip10_Langevin100_Seed42.json'
 
 
 #######################
@@ -81,7 +81,7 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2}
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2}
 if config['net_type'] in ("vanillaLip", "vanillaLip2"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
 else :
@@ -318,7 +318,7 @@ for i in range(start_iter, config['num_train_iters']):
     # compute FID if available
     if feature_extractor is not None and (i == 0 or (i + 1) % config.get('log_freq', 100) == 0):
         # use a bigger batch size for more stable FID estimation if possible
-        fid_batch_size = 3000
+        fid_batch_size = 1000
         x_q_fid = sample_q(batch_size = fid_batch_size)
         x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='uniform', batch_size = fid_batch_size)
         fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor)

@@ -11,7 +11,7 @@
   "data_epsilon": 1.5e-2,
   "_comment": "===== NETWORK AND OPTIMIZER =====",
   "_comment": "net_type should use one of the following: vanilla, nonlocal",
-  "net_type": "vanilla",
+  "net_type": "vanilla2",
   "_comment": "optimizer_type should use one of the following: sgd, adam",
   "optimizer_type": "sgd",
   "lr_init": 1e-2,

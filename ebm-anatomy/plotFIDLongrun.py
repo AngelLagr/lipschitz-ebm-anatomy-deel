@@ -10,7 +10,7 @@ import torch as t
 import torchvision.datasets as datasets
 import torchvision.transforms as tr
 
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 
@@ -69,16 +69,16 @@ def compute_fid_curve(f, config, temp_l, init_type, batch_size, step_list, x_q_f
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--LipConstant', type=int, default = 0)
-    parser.add_argument('--LangevinSteps', type=int, default = 100)
+    parser.add_argument('--LipConstant', type=int, default = 40)
+    parser.add_argument('--LangevinSteps', type=int, default = 10)
     parser.add_argument('--LongrunSteps', type=int, default=1000)
-    parser.add_argument('--FIDBatchSize', type=int, default=2000)
+    parser.add_argument('--FIDBatchSize', type=int, default=3000)
     parser.add_argument('--InitType', type=str, default='uniform', choices=['uniform', 'gaussian'])
     parser.add_argument('--Seed', type=int, default=42)
-    parser.add_argument('--CheckpointName', type=str, default='net_022000.pth')
+    parser.add_argument('--CheckpointName', type=str, default='net_017000.pth')
     args = parser.parse_args()
 
-    exp_dir = './out_data/Expe/mnist_Lip{}_Langevin{}_Seed42/'.format(args.LipConstant, args.LangevinSteps)
+    exp_dir = './out_data/Expe/mnist_Lip{}_Langevin{}_Seed42sgd/'.format(args.LipConstant, args.LangevinSteps)
     config_file = './config_locker/mnist_Lip{}_Langevin{}_Seed42.json'.format(args.LipConstant, args.LangevinSteps)
     checkpoint_file = exp_dir + 'checkpoints/' + args.CheckpointName
     longrun_dir = exp_dir + 'longrun/'
@@ -106,10 +106,11 @@ def main():
         'nonlocal': NonlocalNet,
         'vanillaHalfLip': VanillaNetHalfLip,
         'vanillaLip2': VanillaNetLLip2,
+        'vanilla2': VanillaNet2,
     }
 
-    if config['net_type'] == 'vanillaLip':
-        f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+    if config['net_type'] in ("vanillaLip", "vanillaLip2"):
+        f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=10).to(device)
     else:
         f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
 

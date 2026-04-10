@@ -5,7 +5,7 @@ import torchvision.datasets as datasets
 import pandas as pd
 import argparse
 from utils import*
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2
 from utilfid import load_mnist_feature_extractor, compute_fid_batch
 
 # =========================
@@ -14,9 +14,9 @@ from utilfid import load_mnist_feature_extractor, compute_fid_batch
 # parse the args and set up experiment directory
 
 
-EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin10_Seed42sgd/'
-CONFIG_FILE = './config_locker/mnist_Lip10_Langevin10_Seed42.json'
-CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_032000.pth'
+EXP_DIR = './out_data/Expe/mnist_Lip40_Langevin10_Seed42sgd/'
+CONFIG_FILE = './config_locker/mnist_Lip40_Langevin10_Seed42.json'
+CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_010000.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 3000
 LONGRUN_STEPS = 1000
@@ -138,8 +138,9 @@ net_bank = {
     'nonlocal': NonlocalNet,
     'vanillaHalfLip': VanillaNetHalfLip,
     'vanillaLip2': VanillaNetLLip2,
+    'vanilla2': VanillaNet2,
 }
-if config['net_type'] == 'vanillaLip':
+if config['net_type'] in ("vanillaLip", "vanillaLip2"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
 else:
     f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
@@ -208,6 +209,21 @@ df = pd.read_csv(CSV_FILE)
 iters = df['iteration'].to_numpy()
 fids = df['FID'].to_numpy()
 
+#Calculate the 3 best FID without taking into account the NaN values
+fids_no_nan = fids[~pd.isna(fids)]
+iters_no_nan = iters[~pd.isna(fids)]
+top_k = min(3, len(fids_no_nan))
+best_idx = np.argsort(fids_no_nan)[:top_k]
+best_fids = fids_no_nan[best_idx]
+best_iters = iters_no_nan[best_idx]
+best_fid = best_fids[0]
+best_iter = best_iters[0]
+
+#print the 3 best FID points on the curve
+print(f'Top {top_k} FID points:')
+for i in range(top_k):
+    print(f'Iter={best_iters[i]:.0f}, FID={best_fids[i]:.6f}')
+
 # take the first point and the point where FID <= 10
 idxfirst = 0
 idx10 = next(i for i, v in enumerate(fids) if v <= 10)
@@ -221,3 +237,4 @@ b = y1 - a * x1
 print(f'First point: iter={x1:.0f}, fid={y1:.6f}')
 print(f'Point FID<=10: iter={x2:.0f}, fid={y2:.6f}')
 print(f'Droite: f(x) = a*x + b avec a={a:.8f}, b={b:.8f}')
+
