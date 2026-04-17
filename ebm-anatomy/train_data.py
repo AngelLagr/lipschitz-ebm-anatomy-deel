@@ -10,15 +10,16 @@ import os
 import csv
 import numpy as np
 import random
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2, Wide_ResNet, Wide_ResNet_LLip
 from utils import download_flowers_data, plot_ims, plot_diagnostics
-from utilfid import load_mnist_feature_extractor, compute_fid_batch
+from utilfid import *
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip10_Langevin100_Seed42SGD/'
+EXP_DIR = './out_data/Expe/mnist_Lip_Langevin10_Seed42_NewConstrainedADAM/'
 # json file with experiment config
-CONFIG_FILE = './config_locker/mnist_Lip10_Langevin100_Seed42.json'
-
+CONFIG_FILE = './config_locker/mnist_Lip1_Langevin10_Seed42Constrained.json'
+RANDOMRATE = 0.97
+ALPHA = 0.999 # WConstrained method
 
 #######################
 # ## INITIAL SETUP ## #
@@ -64,13 +65,14 @@ if t.cuda.is_available():
 np.random.seed(config['seed'])
 random.seed(config['seed'])
 start_iter = 0
-loaded_checkpoint = None
 
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
 
 # Initialize FID feature extractor for MNIST
 if config['data'] == 'mnist':
     feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature_extractor.pth', device)
+elif config['data'] == 'cifar10':
+    feature_extractor = InceptionFeatures().half().to(device)
 else:
     feature_extractor = None
 
@@ -81,24 +83,51 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2}
-if config['net_type'] in ("vanillaLip", "vanillaLip2"):
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip}
+if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+elif (config['net_type']=="wideresnet22"):
+    f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
+    current_lip_const=None
+elif (config['net_type']=="wideresnet34"):
+    f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 34).to(device)
+    current_lip_const=None
+elif (config['net_type']=="wideresnetLip22"):
+    f = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'],depth = 22).to(device)
 else :
     f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
+    current_lip_const=None
+
+WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
+WLang_ratio = float(config.get('WLang_ratio', 0.1))
+lower_bound_const = float(config.get('lower_bound_const', 1))
+upper_bound_const = float(config.get('upper_bound_const', 100))
 
 lip_schedule_enabled = config.get('increase_lip_const', False)
 lip_const_start = float(config.get('Lip_const', 10.0))
 lip_const_step = float(config.get('Lip_const_step', 0.5))
 lip_const_max = float(config.get('Lip_const_max', 500.0))
 
-
-def update_lip_const(iteration_idx):
-    if not lip_schedule_enabled or not hasattr(f, 'Lip_const'):
+def update_lip_const(iteration_idx, loss=None, grad=None):
+    lip_const = f.Lip_const
+    if (not lip_schedule_enabled and not WConstrained_enabled) or not hasattr(f, 'Lip_const'):
         return None
-    current_lip_const = min(lip_const_max, lip_const_start + lip_const_step * iteration_idx)
-    f.Lip_const = current_lip_const
-    return current_lip_const
+
+    if lip_schedule_enabled :
+        new_lip_const = min(lip_const_max, lip_const_start + lip_const_step * iteration_idx)
+
+    if WConstrained_enabled and not (grad==None) and not (loss==None):        
+        #new_lip_const = np.clip(lip_const, (lower_bound_const * WLang_ratio/grad).cpu(), (upper_bound_const * WLang_ratio/grad).cpu())
+
+        langevin_steps_remaining_in_buffer = config['num_shortrun_steps']/(1-RANDOMRATE) - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/60000))**iteration_idx)
+        print(f"Estimated Langevin steps remaining in buffer: {langevin_steps_remaining_in_buffer:.2f}")
+        print(f"Current Lip_const: {lip_const:.4f}, Loss: {loss:.4f}, Grad: {grad:.4f}")
+        new_lip = abs(loss)/((grad**2)*lip_const * (max(langevin_steps_remaining_in_buffer,1))) 
+        print(f"Calculated new Lip_const before smoothing: {new_lip:.4f}")
+        new_lip_const = ALPHA*lip_const + (1-ALPHA)*new_lip
+
+    f.Lip_const = new_lip_const
+    return new_lip_const
 
 # set up optimizer
 optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
@@ -121,11 +150,11 @@ transform = tr.Compose([tr.Resize(config['im_sz']),
                         tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
 q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform)]).to(device)
 
+#print size of dataset 
+print('Dataset size:', q.shape[0])
 # initialize persistent images from noise (one persistent image for each data image)
 # s_t_0 is used when init_type == 'persistent' in sample_s_t()
 s_t_0 = 2 * t.rand_like(q) - 1
-if isinstance(loaded_checkpoint, dict) and ('s_t_0' in loaded_checkpoint):
-    s_t_0.copy_(loaded_checkpoint['s_t_0'].to(device))
 
 
 ################################
@@ -148,7 +177,7 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     def sample_s_t_0():
         if init_type == 'persistent':
             # 99% chance each sample comes from s_t_0, 1% chance from uniform random noise
-            mask = t.rand(batch_size, device=device) < 0.97
+            mask = t.rand(batch_size, device=device) < RANDOMRATE
             indices = t.randperm(s_t_0.shape[0], device=device)[:batch_size]
             persistent_samples = s_t_0[indices]
             random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
@@ -229,23 +258,13 @@ fid_record[:] = float('nan')
 instability_record = t.zeros(config['num_train_iters']).to(device)  # stability index in [0, 1]
 instability_record[:] = float('nan')
 fid_score = float('nan')
+lip_const_record = t.zeros(config['num_train_iters']).to(device)
+lip_const_record[:] = float('nan')
 f_x_q_record = t.zeros(config['num_train_iters']).to(device)  # f(x_q).mean()
 f_x_st_record = t.zeros(config['num_train_iters']).to(device)  # f(x_s_t).mean()
 csv_file_path = EXP_DIR + 'plots/' + 'training_metrics.csv'
 last_csv_written = 0
 stability_window = 2
-
-if isinstance(loaded_checkpoint, dict):
-    ckpt_iter = int(loaded_checkpoint.get('iter', 0))
-    d_s_t_record[:ckpt_iter] = loaded_checkpoint['d_s_t_record'][:ckpt_iter].to(device)
-    r_s_t_record[:ckpt_iter] = loaded_checkpoint['r_s_t_record'][:ckpt_iter].to(device)
-    fid_record[:ckpt_iter] = loaded_checkpoint['fid_record'][:ckpt_iter].to(device)
-    instability_record[:ckpt_iter] = loaded_checkpoint['instability_record'][:ckpt_iter].to(device)
-    f_x_q_record[:ckpt_iter] = loaded_checkpoint['f_x_q_record'][:ckpt_iter].to(device)
-    f_x_st_record[:ckpt_iter] = loaded_checkpoint['f_x_st_record'][:ckpt_iter].to(device)
-    fid_score = float(loaded_checkpoint.get('fid_score', float('nan')))
-    last_csv_written = int(loaded_checkpoint.get('last_csv_written', start_iter))
-
 
 def save_full_checkpoint(iteration_idx):
     iter_done = iteration_idx + 1
@@ -263,6 +282,7 @@ def save_full_checkpoint(iteration_idx):
         'fid_score': float(fid_score),
         'last_csv_written': last_csv_written,
         'config': config,
+        'lip_const_record': lip_const_record[:iter_done].detach().cpu(),
     }
     t.save(checkpoint, EXP_DIR + 'checkpoints/' + 'last_checkpoint.pth')
 
@@ -284,7 +304,6 @@ def compute_instability_index(i):
 
 print('Training has started.')
 for i in range(start_iter, config['num_train_iters']):
-    current_lip_const = update_lip_const(i)
 
     # obtain positive and negative samples
     x_q = sample_q()
@@ -299,7 +318,7 @@ for i in range(start_iter, config['num_train_iters']):
     f_x_st = f_x_st_all.mean()
 
     d_s_t = f_x_q - f_x_st
-
+    loss_saved = d_s_t.detach().data.clone() 
     if config['epsilon'] > 0:
         # scale loss with the langevin implementation
         d_s_t *= 2 / (config['epsilon'] ** 2)
@@ -307,12 +326,18 @@ for i in range(start_iter, config['num_train_iters']):
     optim.zero_grad()
     d_s_t.backward()
     optim.step()
+    
+    if lip_schedule_enabled or WConstrained_enabled :
+        current_lip_const = update_lip_const(i, loss=loss_saved, grad=r_s_t)
 
     # record diagnostics
     d_s_t_record[i] = d_s_t.detach().data
     r_s_t_record[i] = r_s_t
+    if lip_schedule_enabled or WConstrained_enabled :
+        lip_const_record[i] = current_lip_const if current_lip_const is not None else float('nan')
     f_x_q_record[i] = f_x_q.detach()
     f_x_st_record[i] = f_x_st.detach()
+    print(f"Iteration {i+1}: f(x_q)={f_x_q_record[i]:.4f}, f(x_s_t)={f_x_st_record[i]:.4f}")
     instability_record[i] = compute_instability_index(i)
     
     # compute FID if available
@@ -321,8 +346,8 @@ for i in range(start_iter, config['num_train_iters']):
         fid_batch_size = 1000
         x_q_fid = sample_q(batch_size = fid_batch_size)
         x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='uniform', batch_size = fid_batch_size)
-        fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor)
-        if fid_score > 100 : fid_score = 100 # cap FID at 100 for better visualization of training progress
+        fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor,config['data'] == 'cifar10')
+        if fid_score > 500 : fid_score = 500 # cap FID at 100 for better visualization of training progress
         fid_record[i] = t.tensor(fid_score).to(device)
 
     # anneal learning rate
@@ -340,7 +365,7 @@ for i in range(start_iter, config['num_train_iters']):
         with open(csv_file_path, 'a', newline='') as csv_file:
             csv_writer = csv.writer(csv_file)
             if not csv_exists:
-                csv_writer.writerow(['iteration', 'FID', 'DST', 'RST', 'Instability', 'fxq', 'fxst'])
+                csv_writer.writerow(['iteration', 'FID', 'DST', 'RST', 'Instability', 'fxq', 'fxst', 'Lip_const'])
             for j in range(last_csv_written, i + 1):
                 csv_writer.writerow([
                     j + 1,
@@ -349,7 +374,8 @@ for i in range(start_iter, config['num_train_iters']):
                     float(r_s_t_record[j].detach().cpu()),
                     float(instability_record[j].detach().cpu()),
                     float(f_x_q_record[j].detach().cpu()),
-                    float(f_x_st_record[j].detach().cpu())
+                    float(f_x_st_record[j].detach().cpu()),
+                    float(lip_const_record[j].detach().cpu())
                 ])
         last_csv_written = i + 1
 

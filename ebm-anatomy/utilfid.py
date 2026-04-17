@@ -3,7 +3,8 @@ import torch.nn as nn
 import numpy as np
 from scipy import linalg
 import os
-
+import torch
+from torchvision.models import inception_v3
 
 class SimpleFeatureExtractor(nn.Module):
     """Simple CNN feature extractor for FID calculation"""
@@ -51,6 +52,39 @@ def load_mnist_feature_extractor(ckpt_path, device):
     return model
 
 
+class InceptionFeatures(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        model = inception_v3(pretrained=True, aux_logits=True)  # False = toujours un tensor
+        model.fc = torch.nn.Identity()
+        model.eval()
+        self.model = model
+
+    def forward(self, x):
+        x = x.half()
+        # x : float [0, 1]  shape (B, 3, 32, 32)
+        x = torch.nn.functional.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1,3,1,1)
+        out = self.model(((x - mean) / std).half())   # (B, 2048)
+
+        if isinstance(out, tuple):  # aux_logits
+            out = out[0]
+
+        return out
+
+
+@torch.no_grad()
+def get_features(x, model):
+    # x : float [-1, 1]  shape (N, 3, 32, 32)
+    x = (x.clamp(-1, 1) + 1) / 2            # → [0, 1]
+    feats = []
+    for batch in x.split(16):
+        feats.append(model(batch))
+    return torch.cat(feats).cpu().numpy()    # (N, 2048)
+
+
+
 def calculate_fid(real_features, generated_features):
     """Calculate Fréchet Inception Distance"""
     if isinstance(real_features, t.Tensor):
@@ -74,11 +108,15 @@ def calculate_fid(real_features, generated_features):
     return fid
 
 
-def compute_fid_batch(real_batch, generated_batch, feature_extractor):
+def compute_fid_batch(real_batch, generated_batch, feature_extractor, cifar=False):
     """Compute FID for a single batch"""
     with t.no_grad():
-        real_feat = feature_extractor(real_batch).cpu().numpy()
-        gen_feat = feature_extractor(generated_batch).cpu().numpy()
+        if cifar :
+            real_feat = get_features(real_batch,feature_extractor)
+            gen_feat = get_features(generated_batch,feature_extractor)
+        else :
+            real_feat = feature_extractor(real_batch).cpu().numpy()
+            gen_feat = feature_extractor(generated_batch).cpu().numpy()
     
     fid = calculate_fid(real_feat, gen_feat)
     return fid

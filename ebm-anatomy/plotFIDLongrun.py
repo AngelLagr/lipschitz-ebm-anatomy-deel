@@ -10,8 +10,8 @@ import torch as t
 import torchvision.datasets as datasets
 import torchvision.transforms as tr
 
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2
-from utilfid import load_mnist_feature_extractor, compute_fid_batch
+from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2, Wide_ResNet, Wide_ResNet_LLip
+from utilfid import *
 
 
 def sample_image_set(image_set, batch_size):
@@ -41,45 +41,55 @@ def init_state(config, batch_size, init_type, device):
     raise ValueError(f'Unknown init_type: {init_type}')
 
 
-def compute_fid_curve(f, config, temp_l, init_type, batch_size, step_list, x_q_fid, feature_extractor, device):
-    x_s_t = init_state(config, batch_size, init_type, device)
-    x_s_t = t.autograd.Variable(x_s_t.clone(), requires_grad=True)
-
+def compute_fid_curve(f, config, temp_l, init_type, batch_size, step_list, x_q_fid, feature_extractor, device, chunk_size=1000):
     target_steps = set(step_list)
     max_steps = max(step_list)
     curve = []
 
-    for ell in range(max_steps):
-        en = f(x_s_t) / temp_l
-        grad = t.autograd.grad(en.sum(), [x_s_t])[0]
+    # Initialise tous les chunks d'un coup
+    x_s_t_chunks = []
+    for i in range(0, batch_size, chunk_size):
+        actual_chunk = min(chunk_size, batch_size - i)
+        chunk = init_state(config, actual_chunk, init_type, device)
+        x_s_t_chunks.append(t.autograd.Variable(chunk.clone(), requires_grad=True))
 
-        if config['epsilon'] > 0:
-            x_s_t.data += -((config['epsilon'] ** 2) / 2) * grad + config['epsilon'] * t.randn_like(x_s_t)
-        else:
-            x_s_t.data += -grad
+    for ell in range(max_steps):
+        # Met à jour chaque chunk séparément
+        for idx, x_s_t in enumerate(x_s_t_chunks):
+            en = f(x_s_t) / temp_l
+            grad = t.autograd.grad(en.sum(), [x_s_t])[0]
+
+            if config['epsilon'] > 0:
+                x_s_t.data += -((config['epsilon'] ** 2) / 2) * grad + config['epsilon'] * t.randn_like(x_s_t)
+            else:
+                x_s_t.data += -grad
 
         current_step = ell + 1
         if current_step in target_steps:
-            fid_value = compute_fid_batch(x_q_fid, x_s_t.detach(), feature_extractor)
+            # Concatène les chunks pour le calcul FID
+            x_s_t_all = t.cat([c.detach() for c in x_s_t_chunks], dim=0)
+            fid_value = compute_fid_batch(x_q_fid, x_s_t_all, feature_extractor, True)
             curve.append((current_step, fid_value))
             print(f'L={current_step:>4d} -> FID={fid_value:.6f}')
+            t.cuda.empty_cache()
 
-    return curve, x_s_t.detach()
+    x_s_t_final = t.cat([c.detach() for c in x_s_t_chunks], dim=0)
+    return curve, x_s_t_final
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--LipConstant', type=int, default = 40)
+    parser.add_argument('--LipConstant', type=int, default = 9.8)
     parser.add_argument('--LangevinSteps', type=int, default = 10)
     parser.add_argument('--LongrunSteps', type=int, default=1000)
-    parser.add_argument('--FIDBatchSize', type=int, default=3000)
+    parser.add_argument('--FIDBatchSize', type=int, default=1000)
     parser.add_argument('--InitType', type=str, default='uniform', choices=['uniform', 'gaussian'])
     parser.add_argument('--Seed', type=int, default=42)
-    parser.add_argument('--CheckpointName', type=str, default='net_017000.pth')
+    parser.add_argument('--CheckpointName', type=str, default='net_020000.pth')
     args = parser.parse_args()
 
-    exp_dir = './out_data/Expe/mnist_Lip{}_Langevin{}_Seed42sgd/'.format(args.LipConstant, args.LangevinSteps)
-    config_file = './config_locker/mnist_Lip{}_Langevin{}_Seed42.json'.format(args.LipConstant, args.LangevinSteps)
+    exp_dir = './out_data/Expe/cifar/ResNet16/cifar10_Langevin10_LipADAM1-100/'
+    config_file = './config_locker/cifar10_Langevin10_LipADAMresnet16.json'
     checkpoint_file = exp_dir + 'checkpoints/' + args.CheckpointName
     longrun_dir = exp_dir + 'longrun/'
     os.makedirs(longrun_dir, exist_ok=True)
@@ -100,19 +110,17 @@ def main():
     if t.cuda.is_available():
         t.cuda.manual_seed_all(args.Seed)
 
-    net_bank = {
-        'vanilla': VanillaNet,
-        'vanillaLip': VanillaNetLLip,
-        'nonlocal': NonlocalNet,
-        'vanillaHalfLip': VanillaNetHalfLip,
-        'vanillaLip2': VanillaNetLLip2,
-        'vanilla2': VanillaNet2,
-    }
-
-    if config['net_type'] in ("vanillaLip", "vanillaLip2"):
-        f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=10).to(device)
-    else:
+    net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip}
+    if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip"):
+        f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+    elif (config['net_type']=="wideresnet22"):
+        f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
+        current_lip_const=None
+    elif (config['net_type']=="wideresnetLip22"):
+        f = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'],depth = 22).to(device)
+    else :
         f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
+        current_lip_const=None
 
     checkpoint = t.load(checkpoint_file, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -135,7 +143,7 @@ def main():
     ])
 
     q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform)]).to(device)
-    feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature_extractor.pth', device)
+    feature_extractor = InceptionFeatures().half().to(device)
 
     with t.no_grad():
         x_q_fid = sample_q(q, config['data_epsilon'], args.FIDBatchSize)
@@ -153,7 +161,8 @@ def main():
         x_q_fid=x_q_fid,
         feature_extractor=feature_extractor,
         device=device,
-    )
+        chunk_size=100
+)
 
     curve_df = pd.DataFrame(curve_points, columns=['longrun_steps', 'FID'])
     curve_csv_path = longrun_dir + 'fid_vs_longrun_steps.csv'
@@ -163,6 +172,7 @@ def main():
 
     plt.figure(figsize=(8, 5))
     plt.plot(curve_df['longrun_steps'], curve_df['FID'], marker='o', linewidth=2)
+    plt.yscale('log')  
     plt.xlabel('Longrun steps (L)')
     plt.ylabel('FID')
     plt.title('FID vs Longrun steps')
