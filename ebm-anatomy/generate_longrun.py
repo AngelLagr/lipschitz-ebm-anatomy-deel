@@ -15,7 +15,7 @@ from utils import plot_ims
 ##################################
 
 
-EXP_DIR = './out_data/Expe/cifar10_Langevin100_ResNET16_3e-4_95/'
+EXP_DIR = './out_data/Expe/cifar/ResNet16/cifar10_Langevin100_ResNET16_3e-4_95/'
 CONFIG_FILE = './config_locker/cifar10_Langevin100Du2.json'
 CHECKPOINT_PATH = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'

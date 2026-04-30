@@ -4,8 +4,11 @@ import torchvision.transforms as tr
 import torchvision.datasets as datasets
 import pandas as pd
 import argparse
+import matplotlib.pyplot as plt
+import torch.fft as fft
+
 from utils import*
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2, Wide_ResNet, Wide_ResNet_LLip
+from nets import *
 from utilfid import *
 
 # =========================
@@ -14,13 +17,22 @@ from utilfid import *
 # parse the args and set up experiment directory
 
 
-EXP_DIR = './out_data/Expe/cifar10_Langevin100_ResNET16_3e-4_95/'
-CONFIG_FILE = './config_locker/cifar10_Langevin100Du2.json'
+EXP_DIR = './out_data/Expe/cifar10_Lip_Langevin10_Seed42CONSTRAINEDNOISEFFT_95_REGUL/'
+# find any json config file in the code directory of the experiment
+CONFIG_FILE = None
+for file in os.listdir(EXP_DIR+'code/'):
+    if file.endswith('.json'):
+        CONFIG_FILE = os.path.join(EXP_DIR+'code/', file)
+        break
+if CONFIG_FILE is None:
+    raise FileNotFoundError(f"No JSON config file found in {EXP_DIR}")
+
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
-FID_BATCH_SIZE = 100
+FID_BATCH_SIZE = 1000
 LONGRUN_STEPS = 3000
 LONGRUN_INIT = 'uniform' 
+FFT_NOISE_BANDS = ('low', 'mid', 'high')
 SEED = 42
 # -------- load config/device --------
 with open(CONFIG_FILE) as file:
@@ -52,18 +64,12 @@ def langevin_grad(f, x_s_t_0_l, config, temp_l, lip_const=None):
 
     # iterative langevin updates of MCMC samples
     for ell in range(LONGRUN_STEPS):
-        en = f(x_s_t_l) 
+        en = f(x_s_t_l) / temp
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
-
-        if config['epsilon'] > 0:
-            x_s_t_l.data += - grad + config['epsilon'] * t.randn_like(x_s_t_l)
-            grads[ell] =  grad.view(grad.shape[0], -1).norm(dim=1).cpu()
-            
-            
-        else:
-            x_s_t_l.data += - grad
-            grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
+        grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        
         if ell == 0 or (ell + 1) % 10 == 0 or (ell + 1) == LONGRUN_STEPS:
             print('Step {} of {}.   Ave. En={:>14.9f}   Ave. Grad={:>14.9f}'.
                   format(ell+1, LONGRUN_STEPS, ens[ell].mean(), grads[ell].mean()), end='\r')
@@ -76,6 +82,43 @@ def sample_q(q, data_epsilon, batch_size):
     return x_q + data_epsilon * t.randn_like(x_q)
 
 
+def make_freq_mask(sz, band, device):
+    y = fft.fftfreq(sz, device=device).reshape(-1, 1)
+    x = fft.fftfreq(sz, device=device).reshape(1, -1)
+    r2 = x**2 + y**2
+    if band == 'low':
+        return t.exp(-r2 / (2 * 0.04**2))
+    elif band == 'mid':
+        low = t.exp(-r2 / (2 * 0.04**2))
+        high = t.exp(-r2 / (2 * 0.15**2))
+        return high - low
+    elif band == 'high':
+        return 1 - t.exp(-r2 / (2 * 0.15**2))
+    raise RuntimeError('Invalid band for frequency mask (use "low", "mid", or "high")')
+
+
+def sample_freq_noise(batch_size, band='mixed'):
+    if band == 'mixed':
+        bands = [random.choice(FFT_NOISE_BANDS) for _ in range(batch_size)]
+    elif band in FFT_NOISE_BANDS:
+        bands = [band] * batch_size
+    else:
+        raise RuntimeError('Invalid band for frequency noise (use "low", "mid", "high", or "mixed")')
+
+    noise = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device)
+    freq = fft.fft2(noise)
+    filtered = t.empty_like(noise)
+
+    for current_band in FFT_NOISE_BANDS:
+        current_inds = [idx for idx, band_name in enumerate(bands) if band_name == current_band]
+        if not current_inds:
+            continue
+        mask = make_freq_mask(config['im_sz'], current_band, device)[None, None, :, :]
+        filtered[current_inds] = fft.ifft2(freq[current_inds] * mask).real
+
+    return filtered / (filtered.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-8)
+
+
 def sample_image_set(image_set, batch_size):
     rand_inds = t.randperm(image_set.shape[0])[:batch_size]
     return image_set[rand_inds]
@@ -85,26 +128,35 @@ def sample_s_t(f, config, device, L, init_type, batch_size, lip_const = None):
         x_s_t_0 = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
     elif init_type == 'gaussian':
         x_s_t_0 = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
+    elif init_type == 'fft':
+        x_s_t_0 = sample_freq_noise(batch_size, band='mixed')
+    else:   
+        raise RuntimeError('Invalid init_type for sample_s_t (use "uniform", "gaussian", or "fft")')
 
     results = []
+    grad_results = []
     for i in range(0, batch_size, 1000):
-        print("Step :",i)
-        print("\n")
+        print(f"\n batch chunk :{i} \n")
         chunk = x_s_t_0[i:i+1000]
-        out = langevin_grad(f, chunk, config, temp, lip_const)[0]
+        out, _, grads = langevin_grad(f, chunk, config, temp, lip_const)
         results.append(out.cpu())
+        grad_results.append(grads)
         t.cuda.empty_cache()
 
-    return t.cat(results, dim=0).to(device)
+    return t.cat(results, dim=0).to(device), t.cat(grad_results, dim=1)
 
 
 
 # -------- build model --------
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip}
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "orthogonium": VanillaNetOrthogonium}
 if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+    current_lip_const=None
 elif (config['net_type']=="wideresnet22"):
     f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
+    current_lip_const=None
+elif (config['net_type']=="wideresnet34"):
+    f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 34).to(device)
     current_lip_const=None
 elif (config['net_type']=="wideresnetLip22"):
     f = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'],depth = 22).to(device)
@@ -178,14 +230,30 @@ x_s_t_longrun = sample_s_t(
     lip_const = lip_const
 )
 
+x_s_t_longrun, longrun_grads = x_s_t_longrun
+
+plt.figure(figsize=(8, 4))
+plt.plot(longrun_grads.mean(dim=1).cpu())
+plt.xlabel('Langevin step')
+plt.ylabel('Mean gradient norm')
+plt.tight_layout()
+plt.savefig(EXP_DIR + 'longrun/' + 'langevin_grads.png', dpi=150)
+plt.close()
+
 #save a litle part of the long-run image for visualisation
 x_s_t_longrun_vis = x_s_t_longrun[:16]
 plot_ims(EXP_DIR + 'longrun/' + 'longrun_sample.png', x_s_t_longrun_vis)
 plot_ims(EXP_DIR + 'longrun/' + 'q_sample.png', x_q_fid[:16])
 
-
 fid_longrun = compute_fid_batch(x_q_fid, x_s_t_longrun, feature_extractor,config['data'] == 'cifar10')
+
+#compute the is score
+is_score = compute_is_batch(x_q_fid, x_s_t_longrun, feature_extractor, config['data'] == 'cifar10')
+
+print(EXP_DIR)
+print(CHECKPOINT_FILE)
 print(f'FID_longrun_from_noise(batch={FID_BATCH_SIZE}, L={LONGRUN_STEPS}, init={LONGRUN_INIT}) = {fid_longrun:.6f}')
+print(f'IS_longrun_from_noise(batch={FID_BATCH_SIZE}, L={LONGRUN_STEPS}, init={LONGRUN_INIT}) = {is_score:.6f}')
 
 # -------- read csv and compute slope a --------
 df = pd.read_csv(CSV_FILE)

@@ -120,3 +120,24 @@ def compute_fid_batch(real_batch, generated_batch, feature_extractor, cifar=Fals
     
     fid = calculate_fid(real_feat, gen_feat)
     return fid
+
+def compute_is_batch(x_q_fid, x_s_t_longrun, feature_extractor, cifar=False):
+    with t.no_grad():
+        if cifar:
+            real_feat = get_features(x_q_fid, feature_extractor)
+            gen_feat = get_features(x_s_t_longrun, feature_extractor)
+        else:
+            real_feat = feature_extractor(x_q_fid).cpu().numpy()
+            gen_feat = feature_extractor(x_s_t_longrun).cpu().numpy()
+    
+    # Compute class probabilities using softmax
+    from scipy.special import softmax
+    p_yx = softmax(gen_feat, axis=1)  # P(y|x)
+    p_y = np.mean(p_yx, axis=0)       # P(y)
+    
+    # Compute KL divergence for each sample
+    kl_divs = np.sum(p_yx * (np.log(p_yx + 1e-10) - np.log(p_y + 1e-10)), axis=1)
+    
+    # Inception Score is exp of average KL divergence
+    inception_score = np.exp(np.mean(kl_divs))
+    return inception_score

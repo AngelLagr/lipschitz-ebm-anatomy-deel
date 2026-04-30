@@ -2,14 +2,12 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 from deel import torchlip
-
+from orthogonium.layers.conv.AOC import AdaptiveOrthoConv2d, AdaptiveOrthoConvTranspose2d
+from orthogonium.reparametrizers import DEFAULT_ORTHO_PARAMS
 
 #################################
 # ## TOY NETWORK FOR 2D DATA ## #
 #################################
-#tester epsbjork none ou non
-#SpectralLinear
-#Groupsort2
 
 class ToyNetLinLip(nn.Module):
     def __init__(self, dim=2, n_f=32, leak=0.05):
@@ -159,6 +157,71 @@ class VanillaNetLLip(nn.Module):
     def forward(self, x):
         return self.Lip_const * self.f(x).squeeze()    
 
+class PixelUnshuffle2x(nn.Module):
+    def forward(self, x):
+        return nn.functional.pixel_unshuffle(x, 2)
+
+class VanillaNetOrthogonium(nn.Module):
+    def __init__(self, n_c=1, n_f=32, Lip_const=1):
+        super(VanillaNetOrthogonium, self).__init__()
+        self.Lip_const = Lip_const
+
+        self.f = nn.Sequential(
+            PixelUnshuffle2x(),   # 1x32x32 -> 4x16x16
+            PixelUnshuffle2x(),   # 4x16x16 -> 16x8x8
+            PixelUnshuffle2x(),   # 16x8x8 -> 64x4x4
+            PixelUnshuffle2x(),   # 64x4x4 -> 256x2x2
+
+            AdaptiveOrthoConv2d(256,64,3,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(64,64,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(64,64,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(64,64,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(64,64,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+
+            nn.Flatten(),
+            torchlip.SpectralLinear(256, 1),
+        )
+
+    def forward(self, x):
+        return self.Lip_const * self.f(x).squeeze()
+
+
+class VanillaNetOrthogoniumCifar(nn.Module):
+    def __init__(self, n_c=3, n_f=32, Lip_const=1):
+        super(VanillaNetOrthogoniumCifar, self).__init__()
+        self.Lip_const = Lip_const
+
+        self.f = nn.Sequential(
+            PixelUnshuffle2x(),   # 3x32x32 -> 12x16x16
+            PixelUnshuffle2x(),   # 12x16x16 -> 48x8x8
+            PixelUnshuffle2x(),   # 48x8x8 -> 192x4x4
+
+            AdaptiveOrthoConv2d(192,192,3,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(192,48,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+            AdaptiveOrthoConv2d(48,48,5,padding="same",padding_mode="circular"),
+            torchlip.GroupSort2(),
+
+
+            nn.Flatten(),
+            torchlip.SpectralLinear(768, 1),
+        )
+
+    def forward(self, x):
+        return self.Lip_const * self.f(x).squeeze()
 
 ######################
 # ## NONLOCAL NET ## #
@@ -323,7 +386,6 @@ class Wide_ResNet(nn.Module):
 # lip
 
 def conv3x3_lip(in_planes, out_planes, stride=1):
-    # Utilisation de SpectralConv2d pour le contrôle de la constante de Lipschitz
     return torchlip.SpectralConv2d(in_planes, out_planes, kernel_size=3, 
                                    stride=stride, padding=1, bias=True)
 
@@ -333,6 +395,7 @@ class wide_basic_lip(nn.Module):
         #self.bn1 = torchlip.BatchCentering(in_planes)
         self.bn1 = Identity()
         self.lip_residual=torchlip.LipResidual()
+
         self.act = torchlip.GroupSort2()
         self.conv1 = torchlip.SpectralConv2d(in_planes, planes, kernel_size=3, 
                                              padding=1, bias=True)
@@ -347,12 +410,11 @@ class wide_basic_lip(nn.Module):
             self.shortcut = nn.Sequential(
                 torchlip.SpectralConv2d(in_planes, planes, kernel_size=1, 
                                         stride=stride, padding=0, bias=True),
-                #torchlip.BatchCentering(planes)
             )
 
     def forward(self, x):
-        out = self.conv1(self.act(self.bn1(x)))
-        out = self.conv2(self.act(self.bn2(out)))
+        out = self.conv1(self.act(self.bn1(x)))    
+        out = self.conv2(self.act(self.bn2(out))) 
         out = (out + self.lip_residual(out, self.shortcut(x)))/2
         return out
 
@@ -360,6 +422,7 @@ class Wide_ResNet_LLip(nn.Module):
     def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
         super().__init__()
         self.Lip_const = Lip_const
+
         self.activation = torchlip.GroupSort2()
         self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
         self.in_planes = 16
@@ -380,7 +443,6 @@ class Wide_ResNet_LLip(nn.Module):
         #self.bn1 = torchlip.BatchCentering(n_stages[3])
         self.bn1 = Identity()
         
-        # La couche linéaire doit aussi être Lipschitz
         self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
 
     def _wide_layer(self, planes, num_blocks, stride):
@@ -396,9 +458,10 @@ class Wide_ResNet_LLip(nn.Module):
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
-        
+
         out = self.bn1(out)
         out = self.activation(out)
+        
         
         out = self.lipavgpool2d(out) 
         

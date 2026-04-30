@@ -10,16 +10,21 @@ import os
 import csv
 import numpy as np
 import random
-from nets import VanillaNet, NonlocalNet, VanillaNetHalfLip, VanillaNetLLip, VanillaNetLLip2, VanillaNet2, Wide_ResNet, Wide_ResNet_LLip
+from nets import *
 from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
+import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip_Langevin10_Seed42_NewConstrainedADAM/'
-# json file with experiment config
-CONFIG_FILE = './config_locker/mnist_Lip1_Langevin10_Seed42Constrained.json'
-RANDOMRATE = 0.97
-ALPHA = 0.999 # WConstrained method
+EXP_DIR = './out_data/Expe/mnist_Lip1_Langevin10_Seed42OrthoConstrained/'
+CONFIG_FILE = './config_locker/mnist_Lip1_Langevin10_Seed42OrthoConstrained.json'
+RANDOMRATE = 0.95
+K_FACTOR = 1.0 # factor to scale the Lipschitz constant for the K constraint
+ALPHA = 0.995 # transition smoothness
+FFT_NOISE = False
+REGUL = False
+LAMBDA_REGUL = 0.5
+FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
 #######################
 # ## INITIAL SETUP ## #
@@ -83,9 +88,10 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip}
-if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip"):
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "orthogonium": VanillaNetOrthogonium}
+if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+    current_lip_const=None
 elif (config['net_type']=="wideresnet22"):
     f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
     current_lip_const=None
@@ -119,10 +125,13 @@ def update_lip_const(iteration_idx, loss=None, grad=None):
     if WConstrained_enabled and not (grad==None) and not (loss==None):        
         #new_lip_const = np.clip(lip_const, (lower_bound_const * WLang_ratio/grad).cpu(), (upper_bound_const * WLang_ratio/grad).cpu())
 
-        langevin_steps_remaining_in_buffer = config['num_shortrun_steps']/(1-RANDOMRATE) - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/60000))**iteration_idx)
+        buffersize = 60000 if config['data'] == 'mnist' else 50000
+        langevin_steps_remaining_in_buffer = config['num_shortrun_steps']/(1-RANDOMRATE) - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**iteration_idx)
         print(f"Estimated Langevin steps remaining in buffer: {langevin_steps_remaining_in_buffer:.2f}")
         print(f"Current Lip_const: {lip_const:.4f}, Loss: {loss:.4f}, Grad: {grad:.4f}")
-        new_lip = abs(loss)/((grad**2)*lip_const * (max(langevin_steps_remaining_in_buffer,1))) 
+        new_lip = abs(loss)/(((grad**2)/lip_const) * (max(langevin_steps_remaining_in_buffer, config['num_shortrun_steps']))) 
+
+        new_lip = K_FACTOR * new_lip 
         print(f"Calculated new Lip_const before smoothing: {new_lip:.4f}")
         new_lip_const = ALPHA*lip_const + (1-ALPHA)*new_lip
 
@@ -152,9 +161,49 @@ q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], tran
 
 #print size of dataset 
 print('Dataset size:', q.shape[0])
+
+def make_freq_mask(sz, band, device):
+    y = fft.fftfreq(sz, device=device).reshape(-1, 1)
+    x = fft.fftfreq(sz, device=device).reshape(1, -1)
+    r2 = x**2 + y**2
+    if band == 'low':
+        return t.exp(-r2 / (2 * 0.04**2))
+    elif band == 'mid':
+        low = t.exp(-r2 / (2 * 0.04**2))
+        high = t.exp(-r2 / (2 * 0.15**2))
+        return high - low
+    elif band == 'high':
+        return 1 - t.exp(-r2 / (2 * 0.15**2))
+    raise RuntimeError('Invalid band for frequency mask (use "low", "mid", or "high")')
+
+
+def sample_freq_noise(batch_size, band='mixed'):
+    if band == 'mixed':
+        bands = [random.choice(FFT_NOISE_BANDS) for _ in range(batch_size)]
+    elif band in FFT_NOISE_BANDS:
+        bands = [band] * batch_size
+    else:
+        raise RuntimeError('Invalid band for frequency noise (use "low", "mid", "high", or "mixed")')
+
+    noise = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device)
+    freq = fft.fft2(noise)
+    filtered = t.empty_like(noise)
+
+    for current_band in FFT_NOISE_BANDS:
+        current_inds = [idx for idx, band_name in enumerate(bands) if band_name == current_band]
+        if not current_inds:
+            continue
+        mask = make_freq_mask(config['im_sz'], current_band, device)[None, None, :, :]
+        filtered[current_inds] = fft.ifft2(freq[current_inds] * mask).real
+
+    return filtered / (filtered.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-8)
 # initialize persistent images from noise (one persistent image for each data image)
 # s_t_0 is used when init_type == 'persistent' in sample_s_t()
-s_t_0 = 2 * t.rand_like(q) - 1
+if FFT_NOISE:
+    s_t_0 = sample_freq_noise(q.shape[0], band='mixed')
+
+else :
+    s_t_0 = 2 * t.rand_like(q) - 1
 
 
 ################################
@@ -171,6 +220,7 @@ def sample_q(batch_size = config['batch_size']):
     x_q = sample_image_set(q, batch_size=batch_size)[0]
     return x_q + config['data_epsilon'] * t.randn_like(x_q)
 
+
 # initialize and update images with langevin dynamics to obtain samples from finite-step MCMC distribution s_t
 def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size']):
     # get initial mcmc states for langevin updates ("persistent", "data", "uniform", or "gaussian")
@@ -180,7 +230,12 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
             mask = t.rand(batch_size, device=device) < RANDOMRATE
             indices = t.randperm(s_t_0.shape[0], device=device)[:batch_size]
             persistent_samples = s_t_0[indices]
-            random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
+
+            if FFT_NOISE:
+                random_samples = sample_freq_noise(batch_size, band='mixed')
+
+            else:
+                random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
             x_s_t_0 = t.where(mask.view(-1, 1, 1, 1), persistent_samples, random_samples)
             sample_inds = indices.clone()
             #sample_inds[~mask] = -1 # mark non-persistent samples with -1 since they won't be used to update s_t_0
@@ -237,6 +292,10 @@ def sample_s_tlongrun(f, config, device, init_type, batch_size):
         x_s_t_0_l = (2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
     elif init_type == 'gaussian':
         x_s_t_0_l = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
+    elif init_type == 'fft':
+        x_s_t_0_l = sample_freq_noise(batch_size, band='mixed')
+    else:
+        raise RuntimeError('Invalid method for "init_type" (use "uniform", "gaussian", or "fft")')
 
     x_s_t_l = x_s_t_0_l.clone()
     
@@ -318,22 +377,28 @@ for i in range(start_iter, config['num_train_iters']):
     f_x_st = f_x_st_all.mean()
 
     d_s_t = f_x_q - f_x_st
+    # conserve the wasserstein distance
     loss_saved = d_s_t.detach().data.clone() 
+
+    if REGUL :
+        d_s_t = d_s_t + LAMBDA_REGUL*(f_x_st**2 + f_x_q**2)
     if config['epsilon'] > 0:
         # scale loss with the langevin implementation
         d_s_t *= 2 / (config['epsilon'] ** 2)
     # stochastic gradient ML update for model weights
+        
     optim.zero_grad()
     d_s_t.backward()
     optim.step()
     
-    if lip_schedule_enabled or WConstrained_enabled :
+    #update only after the 10th iteration to allow initial loss and gradient estimates to stabilize
+    if (lip_schedule_enabled or WConstrained_enabled) and i >= 100:
         current_lip_const = update_lip_const(i, loss=loss_saved, grad=r_s_t)
 
     # record diagnostics
-    d_s_t_record[i] = d_s_t.detach().data
+    d_s_t_record[i] = loss_saved
     r_s_t_record[i] = r_s_t
-    if lip_schedule_enabled or WConstrained_enabled :
+    if (lip_schedule_enabled or WConstrained_enabled):
         lip_const_record[i] = current_lip_const if current_lip_const is not None else float('nan')
     f_x_q_record[i] = f_x_q.detach()
     f_x_st_record[i] = f_x_st.detach()
@@ -342,13 +407,21 @@ for i in range(start_iter, config['num_train_iters']):
     
     # compute FID if available
     if feature_extractor is not None and (i == 0 or (i + 1) % config.get('log_freq', 100) == 0):
-        # use a bigger batch size for more stable FID estimation if possible
-        fid_batch_size = 1000
-        x_q_fid = sample_q(batch_size = fid_batch_size)
-        x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='uniform', batch_size = fid_batch_size)
-        fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor,config['data'] == 'cifar10')
-        if fid_score > 500 : fid_score = 500 # cap FID at 100 for better visualization of training progress
-        fid_record[i] = t.tensor(fid_score).to(device)
+        if (i==0):
+            # set initial FID to a large value 
+            fid_record[i] = t.tensor(500).to(device)
+
+        else :
+            # use a bigger batch size for more stable FID estimation if possible
+            fid_batch_size = 1000
+            x_q_fid = sample_q(batch_size = fid_batch_size)
+            if FFT_NOISE:
+                x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='fft', batch_size = fid_batch_size)
+            else:
+                x_s_t_fid = sample_s_tlongrun(f, config, device, init_type='uniform', batch_size = fid_batch_size)
+            fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor,config['data'] == 'cifar10')
+            if fid_score > 500 : fid_score = 500 # cap FID at 100 for better visualization of training progress
+            fid_record[i] = t.tensor(fid_score).to(device)
 
     # anneal learning rate
     for lr_gp in optim.param_groups:
