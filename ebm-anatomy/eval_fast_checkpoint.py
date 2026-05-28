@@ -17,7 +17,8 @@ from utilfid import *
 # parse the args and set up experiment directory
 
 
-EXP_DIR = './out_data/Expe/cifar10_Lip_Langevin10_Seed42CONSTRAINEDNOISEFFT_95_REGUL/'
+EXP_DIR = './out_data/Expe/cifar10_softplus_lang100/'
+
 # find any json config file in the code directory of the experiment
 CONFIG_FILE = None
 for file in os.listdir(EXP_DIR+'code/'):
@@ -29,9 +30,9 @@ if CONFIG_FILE is None:
 
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
-FID_BATCH_SIZE = 1000
-LONGRUN_STEPS = 3000
-LONGRUN_INIT = 'uniform' 
+FID_BATCH_SIZE = 3000
+LONGRUN_STEPS = 1000
+LONGRUN_INIT = 'fft' 
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 SEED = 42
 # -------- load config/device --------
@@ -64,7 +65,8 @@ def langevin_grad(f, x_s_t_0_l, config, temp_l, lip_const=None):
 
     # iterative langevin updates of MCMC samples
     for ell in range(LONGRUN_STEPS):
-        en = f(x_s_t_l) / temp
+        f_val = f(x_s_t_l)
+        en = f_val / temp
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
         x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
@@ -148,8 +150,8 @@ def sample_s_t(f, config, device, L, init_type, batch_size, lip_const = None):
 
 
 # -------- build model --------
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "orthogonium": VanillaNetOrthogonium}
-if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip"):
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet,'wideresnetSoftplus': Wide_ResNetSoftPlus, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLipSoftplus": Wide_ResNet_LLipSoftPlus, "orthogonium": VanillaNetOrthogonium}
+if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "wideresnetLipSoftplus"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
     current_lip_const=None
 elif (config['net_type']=="wideresnet22"):
@@ -231,6 +233,8 @@ x_s_t_longrun = sample_s_t(
 )
 
 x_s_t_longrun, longrun_grads = x_s_t_longrun
+#scale
+longrun_grads = longrun_grads.detach()
 
 plt.figure(figsize=(8, 4))
 plt.plot(longrun_grads.mean(dim=1).cpu())

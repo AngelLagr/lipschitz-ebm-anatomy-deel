@@ -17,8 +17,8 @@ import torch.fft as fft
 
 # directory for experiment results
 # ─────────────────────────────────────────────────────────────────────────────
-EXP_DIR = './out_data/Expe/cifar10_10&10WARMUP_CLip_Langevin10_Seed42NOISEFFT_95/'
-CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3ConstrainedFFT.json'
+EXP_DIR = './out_data/Expe/cifar10_50&20WARMUP_TESTCLip_Langevin10_Seed42NOISEFFT_95_WIDEMODEL/'
+CONFIG_FILE = './config_locker/cifar10_Langevin10_LipwideDu3ConstrainedFFT.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995 # transition smoothness
@@ -28,9 +28,10 @@ LAMBDA_REGUL = 0.5
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
 # ── Phase-transition parameters ──────────────────────────────────────────────
-NUM_LIP_ITERS         = 30000   # iterations to train the Lipschitz model (phase 1)
-WARMUP_LANGEVIN_STEPS = 10     # Langevin steps to push buffer through old Lip model
-PHASE2_NET_TYPE       = 'wideresnet'  # unconstrained net type for phase 2
+NUM_LIP_ITERS         = 50000   # iterations to train the Lipschitz model (phase 1)
+WARMUP_LANGEVIN_STEPS = 50     # Langevin steps to push buffer through old Lip model
+PHASE2_NET_TYPE       = 'wide3resnet22'  # unconstrained net type for phase 2
+SHORTRUN_STEPS_PHASE2 = 20   # number of Langevin steps for shortrun samples in phase 2 (can be different from phase 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -103,10 +104,14 @@ def build_model(net_type):
         return net_bank[net_type](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
     if net_type == "wideresnet22":
         return net_bank["wideresnet"](n_c=config['im_ch'], depth=22).to(device)
+    if net_type == "wide3resnet22":
+        return net_bank["wideresnet"](n_c=config['im_ch'], depth=22, widen_factor=3).to(device)
     if net_type == "wideresnet34":
         return net_bank["wideresnet"](n_c=config['im_ch'], depth=34).to(device)
     if net_type == "wideresnetLip22":
         return net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'], depth=22).to(device)
+    if net_type == "wide3resnetLip":
+        return net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'], depth=16, widen_factor=3).to(device)
     return net_bank[net_type](n_c=config['im_ch']).to(device)
 
 f = build_model(config['net_type'])
@@ -134,11 +139,12 @@ def update_lip_const(iteration_idx, loss=None, grad=None):
         #new_lip_const = np.clip(lip_const, (lower_bound_const * WLang_ratio/grad).cpu(), (upper_bound_const * WLang_ratio/grad).cpu())
 
         buffersize = 60000 if config['data'] == 'mnist' else 50000
-        langevin_steps_reachable = (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**NUM_LIP_ITERS)
-        langevin_steps_remaining_in_buffer = langevin_steps_reachable - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**iteration_idx)
+        langevin_steps_reachable = (num_shortun_run_steps/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**NUM_LIP_ITERS)
+        langevin_steps_remaining_in_buffer = langevin_steps_reachable - (num_shortun_run_steps/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**iteration_idx)
         print(f"Estimated Langevin steps remaining in buffer: {langevin_steps_remaining_in_buffer:.2f}")
         print(f"Current Lip_const: {lip_const:.4f}, Loss: {loss:.4f}, Grad: {grad:.4f}")
-        new_lip = abs(loss)/(((grad**2)/lip_const) * (max(langevin_steps_remaining_in_buffer, config['num_shortrun_steps']))) 
+        #new_lip = abs(loss)/(((grad**2)/lip_const) * (max(langevin_steps_remaining_in_buffer, num_shortun_run_steps))) 
+        new_lip = abs(loss)/(((grad**2)/lip_const) * WARMUP_LANGEVIN_STEPS) 
 
         new_lip = K_FACTOR * new_lip 
         print(f"Calculated new Lip_const before smoothing: {new_lip:.4f}")
@@ -391,6 +397,7 @@ def compute_instability_index(i):
 print('Training has started.')
 phase = 1          # 1 = Lipschitz model,  2 = unconstrained model
 f_lip = None       # will hold the frozen Lip model after transition
+num_shortun_run_steps = config['num_shortrun_steps']
 for i in range(start_iter, config['num_train_iters']):
 
     if phase == 1 and i >= NUM_LIP_ITERS:
@@ -402,6 +409,7 @@ for i in range(start_iter, config['num_train_iters']):
         #Save the Lip model checkpoint
         t.save(f_lip.state_dict(), EXP_DIR + 'checkpoints/' + 'lip_model.pth')
 
+        num_shortun_run_steps = SHORTRUN_STEPS_PHASE2
         f = build_model(PHASE2_NET_TYPE)
         current_lip_const = None
         optim = optim_bank[config['optimizer_type']](f.parameters(), lr=config['lr_init'])
@@ -410,7 +418,7 @@ for i in range(start_iter, config['num_train_iters']):
 
     # obtain positive and negative samples
     x_q = sample_q()
-    x_s_t, r_s_t = sample_s_t(L=config['num_shortrun_steps'], init_type=config['shortrun_init'])
+    x_s_t, r_s_t = sample_s_t(L=num_shortun_run_steps, init_type=config['shortrun_init'])
 
     # calculate ML computational loss d_s_t (Section 3) for data and shortrun samples
 

@@ -383,6 +383,55 @@ class Wide_ResNet(nn.Module):
         logits = self.linear(out)
         return logits.logsumexp(1)          # scalar energy per sample → (B,)
 
+
+
+class Wide_ResNetSoftPlus(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, norm=None, leak=0.2, n_classes=10):
+        super().__init__()
+        self.lrelu    = nn.LeakyReLU(leak)
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        nStages = [16, 16*k, 32*k, 64*k]
+
+        self.conv1  = conv3x3(n_c, nStages[0])
+        self.layer1 = self._wide_layer(nStages[1], n, stride=1, norm=norm, leak=leak)
+        self.layer2 = self._wide_layer(nStages[2], n, stride=2, norm=norm, leak=leak)
+        self.layer3 = self._wide_layer(nStages[3], n, stride=2, norm=norm, leak=leak)
+        self.bn1    = get_norm(nStages[3], norm)
+        self.linear = nn.Linear(nStages[3], n_classes)
+        self.softplus = nn.Softplus()
+
+    def _wide_layer(self, planes, num_blocks, stride, norm, leak):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers  = []
+        for s in strides:
+            layers.append(wide_basic(self.in_planes, planes, stride=s, norm=norm, leak=leak))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.lrelu(self.bn1(out))
+        out = F.avg_pool2d(out, 8)
+        out = out.view(out.size(0), -1)
+        logits = self.linear(out)
+        return self.softplus(logits).logsumexp(1)          # scalar energy per sample → (B,)
+
+
+
+
+
+
+
+
+
+
 # lip
 
 def conv3x3_lip(in_planes, out_planes, stride=1):
@@ -469,3 +518,56 @@ class Wide_ResNet_LLip(nn.Module):
         
         logits = self.linear(out)
         return self.Lip_const * logits.logsumexp(1)
+
+class Wide_ResNet_LLipSoftPlus(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
+        super().__init__()
+        self.Lip_const = Lip_const
+
+        self.activation = torchlip.GroupSort2()
+        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        n_stages = [16, 16*k, 32*k, 64*k]
+
+        # Première couche
+        self.conv1 = conv3x3_lip(n_c, n_stages[0])
+        
+        # Couches Wide ResNet
+        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
+        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
+        self.layer3 = self._wide_layer(n_stages[3], n, stride=2)
+        
+        #self.bn1 = torchlip.BatchCentering(n_stages[3])
+        self.bn1 = Identity()
+        
+        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.softplus = nn.Softplus()
+
+    def _wide_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        out = self.bn1(out)
+        out = self.activation(out)
+        
+        
+        out = self.lipavgpool2d(out) 
+        
+        out = out.view(out.size(0), -1)
+        
+        logits = self.linear(out)
+        return self.Lip_const * self.softplus(logits).logsumexp(1)

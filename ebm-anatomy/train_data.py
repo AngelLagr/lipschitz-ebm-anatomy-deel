@@ -10,21 +10,22 @@ import os
 import csv
 import numpy as np
 import random
+import torch.nn.functional as F
 from nets import *
 from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/mnist_Lip1_Langevin10_Seed42OrthoConstrained/'
-CONFIG_FILE = './config_locker/mnist_Lip1_Langevin10_Seed42OrthoConstrained.json'
+EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR/'
+CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
-K_FACTOR = 1.0 # factor to scale the Lipschitz constant for the K constraint
+K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995 # transition smoothness
-FFT_NOISE = False
-REGUL = False
-LAMBDA_REGUL = 0.5
+FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
+HKR_LOSS = True
+LAMBDA_HKR = 1.0
 
 #######################
 # ## INITIAL SETUP ## #
@@ -88,7 +89,7 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "orthogonium": VanillaNetOrthogonium}
+net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet,'wideresnetSoftplus': Wide_ResNetSoftPlus, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLipSoftplus": Wide_ResNet_LLipSoftPlus, "orthogonium": VanillaNetOrthogonium}
 if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
     current_lip_const=None
@@ -258,7 +259,8 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     x_s_t = t.autograd.Variable(x_s_t_0.clone(), requires_grad=True)
     r_s_t = t.zeros(1).to(device)  # variable r_s_t (Section 3.2) to record average gradient magnitude
     for ell in range(L):
-        f_prime = t.autograd.grad(f(x_s_t).sum(), [x_s_t])[0]
+        f_val = f(x_s_t)
+        f_prime = t.autograd.grad(f_val.sum(), [x_s_t])[0]
         x_s_t.data += - f_prime + config['epsilon'] * t.randn_like(x_s_t)
         r_s_t += f_prime.view(f_prime.shape[0], -1).norm(dim=1).mean()
 
@@ -279,7 +281,8 @@ def langevin_grad(f, x_s_t_0_l, config,temp,batch_size):
 
     # iterative langevin updates of MCMC samples
     for ell in range(config['num_longrun_steps']):
-        en = f(x_s_t_l) / temp
+        f_val = f(x_s_t_l)
+        en = f_val / temp
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
         x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
@@ -371,29 +374,48 @@ for i in range(start_iter, config['num_train_iters']):
     # calculate ML computational loss d_s_t (Section 3) for data and shortrun samples
 
     f_x_q_all = f(x_q)
-    f_x_q = f_x_q_all.mean()
-
     f_x_st_all = f(x_s_t)
-    f_x_st = f_x_st_all.mean()
 
-    d_s_t = f_x_q - f_x_st
-    # conserve the wasserstein distance
-    loss_saved = d_s_t.detach().data.clone() 
+    # Optionally use HKR (Hinge-KR) loss similar to dual-head warmup implementation.
+    if HKR_LOSS:
+        # normalize by gradient magnitude as in dual-head implementation
+        logits_q = f_x_q_all / (r_s_t + 1e-8)
+        logits_s = f_x_st_all / (r_s_t + 1e-8)
 
-    if REGUL :
-        d_s_t = d_s_t + LAMBDA_REGUL*(f_x_st**2 + f_x_q**2)
+        f_x_q = logits_q.mean()
+        f_x_st = logits_s.mean()
+
+        kr_term = f_x_q - f_x_st
+
+        hinge_inputs = t.cat([logits_q, logits_s], dim=0)
+        hinge_labels = t.cat([-t.ones(logits_q.size(0), device=device),
+                              t.ones(logits_s.size(0), device=device)])
+
+        hinge_term = F.relu(1.0 - hinge_labels * hinge_inputs).mean()
+
+        hkr_term = kr_term + LAMBDA_HKR * hinge_term
+        loss_raw = hkr_term
+        loss_saved = hkr_term.detach().data.clone() # scale back up by gradient magnitude for logging and lip_const update
+    else:
+        f_x_q = f_x_q_all.mean()
+        f_x_st = f_x_st_all.mean()
+        loss_raw = f_x_q - f_x_st
+        loss_saved = loss_raw.detach().data.clone()
+
+    # scale loss with the langevin implementation if needed
     if config['epsilon'] > 0:
-        # scale loss with the langevin implementation
-        d_s_t *= 2 / (config['epsilon'] ** 2)
+        d_s_t = loss_raw * 2 / (config['epsilon'] ** 2)
+    else:
+        d_s_t = loss_raw
+
     # stochastic gradient ML update for model weights
-        
     optim.zero_grad()
     d_s_t.backward()
     optim.step()
     
     #update only after the 10th iteration to allow initial loss and gradient estimates to stabilize
-    if (lip_schedule_enabled or WConstrained_enabled) and i >= 100:
-        current_lip_const = update_lip_const(i, loss=loss_saved, grad=r_s_t)
+    if (lip_schedule_enabled or WConstrained_enabled) and i >=200:
+        current_lip_const = update_lip_const(i, loss=kr_term * r_s_t, grad=r_s_t)
 
     # record diagnostics
     d_s_t_record[i] = loss_saved
