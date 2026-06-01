@@ -503,39 +503,34 @@ hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 for i in range(start_iter, num_train_iters):
     training_mode = 'hkr' if i < HKR_WARMUP_ITERS else 'theta'
 
-    x_q = sample_q()
+    x_q = sample_q() # data samples
     x_s_t, r_s_t = sample_s_t(
         L=num_shortrun_steps,
         init_type=config['shortrun_init'],
         langevin_head=training_mode,
-    )
+    ) # negative samples
 
+    # Compute energies
     ebm_q, hkr_q = f.energy_components(x_q)
     ebm_s, hkr_s = f.energy_components(x_s_t)
 
-    
-
+    # HKR loss
     f_x_q_hkr = hkr_q.mean()
     f_x_st_hkr = hkr_s.mean()
-
     kr_term = f_x_q_hkr - f_x_st_hkr
-
     hkr_input = t.cat([hkr_q, hkr_s], dim=0).reshape(-1, 1)
     hkr_target = t.cat([
         -t.ones_like(hkr_q),
         t.ones_like(hkr_s),
     ], dim=0).reshape(-1, 1)
-
     hkr_loss = hkr_loss_fn(hkr_input, hkr_target)
 
-
-
-
-
+    # EBM loss
     f_x_q_ebm = ebm_q.mean()
     f_x_st_ebm = ebm_s.mean()
     ebm_loss = f_x_q_ebm - f_x_st_ebm
 
+    # warmup with HKR loss only, then switch to combined loss
     if i < HKR_WARMUP_ITERS:
         loss_raw = hkr_loss
         loss_saved = hkr_loss.detach().data.clone()
@@ -543,6 +538,7 @@ for i in range(start_iter, num_train_iters):
         loss_raw = ebm_loss + LAMBDA_HKR*hkr_loss
         loss_saved = loss_raw.detach().data.clone()
 
+    # Scale the loss like we did in the langevin
     if config['epsilon'] > 0:
         d_s_t = loss_raw * 2 / (config['epsilon'] ** 2)
     else:
@@ -552,9 +548,11 @@ for i in range(start_iter, num_train_iters):
     d_s_t.backward()
     optim.step()
 
+    # Update Lipschitz constant if Wasserstein constraint is enabled 
     if WConstrained_enabled and i >= HKR_WARMUP_ITERS:
         current_lip_const = update_lip_const(i, loss=kr_term * r_s_t, grad=r_s_t)
 
+    # Record metrics and fid
     d_s_t_record[i] = loss_saved if loss_saved < 600 else float(600)
     d_s_t_lip_record[i] = hkr_loss.detach()
     d_s_t_nonlip_record[i] = ebm_loss.detach()
