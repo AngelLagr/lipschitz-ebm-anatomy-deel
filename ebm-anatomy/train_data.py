@@ -11,13 +11,14 @@ import csv
 import numpy as np
 import random
 import torch.nn.functional as F
+from deel.torchlip.modules.loss import HKRLoss
 from nets import *
 from utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR/'
+EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha09/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
@@ -25,7 +26,7 @@ ALPHA = 0.995 # transition smoothness
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 HKR_LOSS = True
-LAMBDA_HKR = 1.0
+HKR_ALPHA = 0.99
 
 #######################
 # ## INITIAL SETUP ## #
@@ -104,6 +105,8 @@ elif (config['net_type']=="wideresnetLip22"):
 else :
     f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
     current_lip_const=None
+
+hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 
 WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
 WLang_ratio = float(config.get('WLang_ratio', 0.1))
@@ -373,29 +376,23 @@ for i in range(start_iter, config['num_train_iters']):
 
     # calculate ML computational loss d_s_t (Section 3) for data and shortrun samples
 
-    f_x_q_all = f(x_q)
-    f_x_st_all = f(x_s_t)
+    logits_q = f(x_q)
+    logits_s = f(x_s_t)
 
-    # Optionally use HKR (Hinge-KR) loss similar to dual-head warmup implementation.
     if HKR_LOSS:
-        # normalize by gradient magnitude as in dual-head implementation
-        logits_q = f_x_q_all / (r_s_t + 1e-8)
-        logits_s = f_x_st_all / (r_s_t + 1e-8)
-
         f_x_q = logits_q.mean()
         f_x_st = logits_s.mean()
 
         kr_term = f_x_q - f_x_st
 
-        hinge_inputs = t.cat([logits_q, logits_s], dim=0)
-        hinge_labels = t.cat([-t.ones(logits_q.size(0), device=device),
-                              t.ones(logits_s.size(0), device=device)])
+        hkr_input = t.cat([logits_q, logits_s], dim=0).reshape(-1, 1)
+        hkr_target = t.cat([
+            -t.ones_like(logits_q),
+            t.ones_like(logits_s),
+        ], dim=0).reshape(-1, 1)
 
-        hinge_term = F.relu(1.0 - hinge_labels * hinge_inputs).mean()
-
-        hkr_term = kr_term + LAMBDA_HKR * hinge_term
-        loss_raw = hkr_term
-        loss_saved = hkr_term.detach().data.clone() # scale back up by gradient magnitude for logging and lip_const update
+        loss_raw = hkr_loss_fn(hkr_input, hkr_target)
+        loss_saved = loss_raw.detach().clone()
     else:
         f_x_q = f_x_q_all.mean()
         f_x_st = f_x_st_all.mean()
@@ -413,7 +410,7 @@ for i in range(start_iter, config['num_train_iters']):
     d_s_t.backward()
     optim.step()
     
-    #update only after the 10th iteration to allow initial loss and gradient estimates to stabilize
+    #update only after the 200th iteration to allow initial loss and gradient estimates to stabilize
     if (lip_schedule_enabled or WConstrained_enabled) and i >=200:
         current_lip_const = update_lip_const(i, loss=kr_term * r_s_t, grad=r_s_t)
 

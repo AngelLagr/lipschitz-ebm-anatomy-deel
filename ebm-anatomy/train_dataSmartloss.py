@@ -22,18 +22,26 @@ from utils import download_flowers_data, plot_diagnostics, plot_ims
 
 # directory for experiment results
 # -----------------------------------------------------------------------------
-EXP_DIR = './out_data/Expe/cifar10_Langevin10_WARMUPHKRSTRONGDualHeadCentre0Tau1HINGE10LipDu3FFTSmartlossCONTINU/'
+EXP_DIR = './out_data/Expe/cifar10_Langevin10_WARMUP/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
+
+# Lipschitz constraint settings
 K_FACTOR = 2.0  # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995  # transition smoothness
+
+# FFT noise settings
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
-LAMBDA_HINGE_HKR = 1.0
-LAMBDA_HKR = 10.0 
-HKR_WARMUP_ITERS = 5000
+
+# Sigmoid param
 HKR_THRESHOLD = 0.0
 TAU = 1.0
+
+HKR_ALPHA = 0.99 # Hkr loss alpha param
+
+LAMBDA_HKR = 10.0 # Weight for HKR loss in the combined loss 
+HKR_WARMUP_ITERS = 5000 # number iteration with the HKR only
 # -----------------------------------------------------------------------------
 
 
@@ -490,6 +498,7 @@ def compute_instability_index(i):
 
 print('Training has started.')
 num_shortrun_steps = config['num_shortrun_steps']
+hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 
 for i in range(start_iter, num_train_iters):
     training_mode = 'hkr' if i < HKR_WARMUP_ITERS else 'theta'
@@ -504,18 +513,24 @@ for i in range(start_iter, num_train_iters):
     ebm_q, hkr_q = f.energy_components(x_q)
     ebm_s, hkr_s = f.energy_components(x_s_t)
 
-    logits_q_hkr = hkr_q / (r_s_t + 1e-8)
-    logits_s_hkr = hkr_s / (r_s_t + 1e-8)
-    f_x_q_hkr = logits_q_hkr.mean()
-    f_x_st_hkr = logits_s_hkr.mean()
+    
+
+    f_x_q_hkr = hkr_q.mean()
+    f_x_st_hkr = hkr_s.mean()
+
     kr_term = f_x_q_hkr - f_x_st_hkr
 
-    hinge_inputs = t.cat([logits_q_hkr, logits_s_hkr], dim=0)
-    hinge_labels = t.cat([-t.ones(logits_q_hkr.size(0), device=device),
-                          t.ones(logits_s_hkr.size(0), device=device)])
+    hkr_input = t.cat([hkr_q, hkr_s], dim=0).reshape(-1, 1)
+    hkr_target = t.cat([
+        -t.ones_like(hkr_q),
+        t.ones_like(hkr_s),
+    ], dim=0).reshape(-1, 1)
 
-    hinge_term = F.relu(1.0 - hinge_labels * hinge_inputs).mean()
-    hkr_loss = kr_term + LAMBDA_HINGE_HKR * hinge_term
+    hkr_loss = hkr_loss_fn(hkr_input, hkr_target)
+
+
+
+
 
     f_x_q_ebm = ebm_q.mean()
     f_x_st_ebm = ebm_s.mean()

@@ -17,7 +17,7 @@ from utilfid import *
 # parse the args and set up experiment directory
 
 
-EXP_DIR = './out_data/Expe/cifar10_softplus_lang100/'
+EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR/'
 
 # find any json config file in the code directory of the experiment
 CONFIG_FILE = None
@@ -31,7 +31,7 @@ if CONFIG_FILE is None:
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 3000
-LONGRUN_STEPS = 1000
+LONGRUN_STEPS = 400
 LONGRUN_INIT = 'fft' 
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 SEED = 42

@@ -11,9 +11,9 @@ from utils import*
 from nets import *
 
 
-EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR/'
-BATCH_SIZE = 100
-REFINE_STEPS = 1000
+EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha09/'
+BATCH_SIZE = 1000
+REFINE_STEPS = 400
 SEED = 42
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
@@ -158,7 +158,7 @@ def main():
     plt.figure(figsize=(8, 4))
     plt.hist(hkr_data, bins=50, alpha=0.5, label='data')
     plt.hist(hkr_noise, bins=50, alpha=0.5, label='noise')
-    plt.hist(hkr_refined, bins=50, alpha=0.5, label='noise refined')
+    plt.hist(hkr_refined, bins=50, alpha=0.5, label='noise refined shortrun')
     plt.legend()
     plt.title('HKR values histogram (data / noise / noise refined)')
     plt.tight_layout()
