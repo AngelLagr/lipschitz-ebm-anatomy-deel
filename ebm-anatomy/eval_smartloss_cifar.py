@@ -12,25 +12,28 @@ import torchvision.datasets as datasets
 import torchvision.transforms as tr
 from deel import torchlip
 
+from utilfid import InceptionFeatures, compute_fid_batch, load_mnist_feature_extractor
 from utils import plot_ims
 
 
 # =========================
 # SIMPLE CONFIG
 # =========================
-EXP_DIR = './out_data/Expe/cifar10_Langevin10_WARMUPHKRSTRONGDualHeadCentre0Tau1HINGE1LipDu3FFTSmartlossCONTINU/'
+EXP_DIR = './out_data/Expe/cifar10_Langevin10_WARMUP_alpha0999_lossnorm_featureonlyonHKR/'
 CHECKPOINTS = {
-    'stable': EXP_DIR + 'checkpoints/net_084000.pth',
-    'exploding': EXP_DIR + 'checkpoints/net_110000.pth',
+    'stable': EXP_DIR + 'checkpoints/last_checkpoint.pth',
+    'exploding': EXP_DIR + 'checkpoints/net_150000.pth',
 }
 CSV_FILE = EXP_DIR + 'plots/eval_smartloss_cifar_metrics.csv'
 PLOT_DIR = EXP_DIR + 'plots/eval_smartloss_cifar/'
 
-LONGRUN_STEPS = 1000
-LONGRUN_INIT = 'fft'
-LONGRUN_BATCH_SIZE = 400
+LONGRUN_STEPS = 10
+LONGRUN_INIT = 'checkpoint'  # 'fft' | 'checkpoint'
+LONGRUN_BATCH_SIZE = 100
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 SEED = 42
+HKR_THRESHOLD = 0.0
+HKR_TAU = 0.3
 
 CONFIG_FILE = None
 for file in os.listdir(EXP_DIR + 'code/'):
@@ -52,6 +55,13 @@ if config['epsilon'] > 0:
     temp = (config['epsilon'] ** 2) / 2
 else:
     temp = 1.0
+
+if config['data'] == 'mnist':
+    feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature_extractor.pth', device)
+elif config['data'] == 'cifar10':
+    feature_extractor = InceptionFeatures().half().to(device)
+else:
+    feature_extractor = None
 
 
 # =========================
@@ -186,11 +196,12 @@ def build_model():
         n_c=config['im_ch'],
         n_classes=config.get('n_classes', 10),
         lip_const=config.get('Lip_const', 1.0),
-        hkr_switch_threshold=0.0,
-        hkr_tau=0.5,
+        hkr_switch_threshold=HKR_THRESHOLD,
+        hkr_tau=HKR_TAU,
     ).to(device)
 
 
+# 2. load_checkpoint retourne aussi le dict brut
 def load_checkpoint(model, checkpoint_path):
     checkpoint = t.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -200,7 +211,7 @@ def load_checkpoint(model, checkpoint_path):
     else:
         model.load_state_dict(checkpoint)
     model.eval()
-    return model
+    return model, checkpoint  # <-- on expose le dict
 
 
 # =========================
@@ -251,6 +262,27 @@ def sample_image_set(image_set, batch_size):
 def sample_q(q, batch_size):
     x_q = sample_image_set(q, batch_size=batch_size)
     return x_q + config['data_epsilon'] * t.randn_like(x_q)
+
+
+# 3. Nouvelle fonction (calquée sur eval_hkr_simple)
+def sample_checkpoint_noise(checkpoint, batch_size):
+    if not (isinstance(checkpoint, dict) and 's_t_0' in checkpoint):
+        raise RuntimeError('Checkpoint does not contain s_t_0')
+    buffer = checkpoint['s_t_0'].to(device)
+    if buffer.shape[0] < batch_size:
+        raise RuntimeError(
+            f's_t_0 buffer too small: has {buffer.shape[0]} samples, needs {batch_size}'
+        )
+    inds = t.randperm(buffer.shape[0], device=device)[:batch_size]
+    return buffer[inds]
+
+
+def sample_init_noise(checkpoint, batch_size):
+    if LONGRUN_INIT == 'fft':
+        return sample_freq_noise(batch_size, band='mixed')
+    if LONGRUN_INIT == 'checkpoint':
+        return sample_checkpoint_noise(checkpoint, batch_size)
+    raise RuntimeError(f'Invalid LONGRUN_INIT: {LONGRUN_INIT!r} (use "fft" or "checkpoint")')
 
 
 def load_cifar_data():
@@ -407,11 +439,11 @@ def main():
             continue
 
         print(f'\n=== Evaluating {tag} ===')
-        model = load_checkpoint(build_model(), checkpoint_path)
+        model, checkpoint = load_checkpoint(build_model(), checkpoint_path) 
 
         x_eval = sample_q(data, LONGRUN_BATCH_SIZE)
-        x_noise_init = sample_freq_noise(LONGRUN_BATCH_SIZE, band='mixed')
-
+        x_noise_init = sample_init_noise(checkpoint, LONGRUN_BATCH_SIZE)    # remplace l'appel direct
+        
         with t.no_grad():
             data_scores = model(x_eval, head='hkr').detach().cpu().numpy()
             noise_scores = model(x_noise_init, head='hkr').detach().cpu().numpy()
@@ -420,6 +452,13 @@ def main():
         noise_acc = hkr_accuracy(t.from_numpy(noise_scores), target_is_positive=True)
 
         x_theta_longrun, theta_curves = langevin_longrun_theta(model, x_noise_init)
+        fid_theta_longrun = compute_fid_batch(
+            x_eval,
+            x_theta_longrun,
+            feature_extractor,
+            config['data'] == 'cifar10',
+        )
+
         with t.no_grad():
             theta_refined_scores = model(x_theta_longrun, head='hkr').detach().cpu().numpy()
 
@@ -432,7 +471,11 @@ def main():
         hkr_refined_acc = hkr_accuracy(t.from_numpy(hkr_refined_scores), target_is_positive=True)
 
         print('\n')
-        print(f'{tag}: data_acc={data_acc:.4f}  noise_acc={noise_acc:.4f}  theta_refined_acc={theta_refined_acc:.4f}  hkr_refined_acc={hkr_refined_acc:.4f}')
+        print(
+            f'{tag}: data_acc={data_acc:.4f}  noise_acc={noise_acc:.4f}  '
+            f'theta_refined_acc={theta_refined_acc:.4f}  hkr_refined_acc={hkr_refined_acc:.4f}  '
+            f'fid_theta_longrun={fid_theta_longrun:.6f}'
+        )
 
         tag_dir = os.path.join(PLOT_DIR, tag)
         os.makedirs(tag_dir, exist_ok=True)
@@ -474,6 +517,7 @@ def main():
             'data_acc': data_acc,
             'noise_acc': noise_acc,
             'refined_acc': theta_refined_acc,
+            'fid_longrun': fid_theta_longrun,
         })
         hkr_step_df = pd.DataFrame({
             'step': np.arange(1, LONGRUN_STEPS + 1),

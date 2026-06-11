@@ -5,17 +5,19 @@ import random
 import matplotlib.pyplot as plt
 import torch as t
 import torch.fft as fft
+import torchvision as tv
 import torchvision.datasets as datasets
 import torchvision.transforms as tr
 from utils import*
 from nets import *
 
 
-EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha09/'
-BATCH_SIZE = 1000
-REFINE_STEPS = 400
+EXP_DIR = './out_data/Expe/hkrtest/cifar10_lip_lang10_HKR_REAL_alpha0999/'
+BATCH_SIZE = 200
+REFINE_STEPS = 10
 SEED = 42
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
+NOISE_INIT = 'checkpoint'  # 'fft' or 'uniform' or 'checkpoint'
 
 
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
@@ -71,13 +73,16 @@ def build_model(config):
     return net_bank[net_type](n_c=config['im_ch']).to(device)
 
 
-def load_model(config, checkpoint_path):
+def load_checkpoint(checkpoint_path):
+    return t.load(checkpoint_path, map_location=device)
+
+
+def load_model(config, checkpoint):
     model = build_model(config)
-    ckpt = t.load(checkpoint_path, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        model.load_state_dict(ckpt)
+        model.load_state_dict(checkpoint)
     model.eval()
     return model
 
@@ -113,6 +118,24 @@ def sample_freq_noise(config, batch_size):
     return filtered / (filtered.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-8)
 
 
+def sample_init_noise(config, batch_size, noise_init=NOISE_INIT):
+    if noise_init == 'fft':
+        return sample_freq_noise(config, batch_size)
+    if noise_init == 'uniform':
+        return 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
+    raise RuntimeError('Invalid noise init type (use "fft" or "uniform")')
+
+
+def sample_checkpoint_noise(checkpoint, config, batch_size):
+    if not (isinstance(checkpoint, dict) and 's_t_0' in checkpoint):
+        raise RuntimeError('Checkpoint does not contain s_t_0')
+    buffer = checkpoint['s_t_0'].to(device)
+    if buffer.shape[0] < batch_size:
+        raise RuntimeError(f's_t_0 buffer too small: has {buffer.shape[0]} samples, needs {batch_size}')
+    inds = t.randperm(buffer.shape[0], device=device)[:batch_size]
+    return buffer[inds]
+
+
 def sample_data_batch(config, batch_size):
     transform = tr.Compose([
         tr.Resize(config['im_sz']),
@@ -134,6 +157,19 @@ def langevin_refine(model, x0, eps, steps):
     return x.detach()
 
 
+def louis_refine(model, x0, iters=5,noise_eps=0.1):
+    x = x0.clone().detach().requires_grad_(True)
+
+    for _ in range(iters):
+        energy_lip = model(x)
+        grad_lip = t.autograd.grad(energy_lip.sum(), [x])[0]
+        step_size = (noise_eps*t.randn_like(energy_lip) + energy_lip) / (grad_lip.view(grad_lip.size(0), -1).norm(dim=1) ** 2 + 1e-8)
+        x = (x - step_size.view(-1, 1, 1, 1) * grad_lip).detach().requires_grad_(True)
+
+
+    return x.detach()
+
+
 def main():
     config_path = find_config(EXP_DIR)
     ckpt_path = find_checkpoint(EXP_DIR)
@@ -141,89 +177,111 @@ def main():
     with open(config_path) as f:
         config = json.load(f)
 
-    model = load_model(config, ckpt_path)
+    checkpoint = load_checkpoint(ckpt_path)
+    model = load_model(config, checkpoint)
     x_data = sample_data_batch(config, BATCH_SIZE)
-    x_noise = sample_freq_noise(config, BATCH_SIZE)
+    if NOISE_INIT == 'checkpoint':
+        x_noise = sample_checkpoint_noise(checkpoint, config, BATCH_SIZE)
+    else:
+        x_noise = sample_init_noise(config, BATCH_SIZE, noise_init=NOISE_INIT)
     x_refined = langevin_refine(model, x_noise, config['epsilon'], REFINE_STEPS)
+    
+    #plot ims the xrefined
+    out_dir = os.path.join(EXP_DIR, 'plots')
+    os.makedirs(out_dir, exist_ok=True)
+    plot_ims(os.path.join(out_dir, 'x_refined.png'), x_refined[:64])
+
+
+    x_louis_fromnoise = louis_refine(model, x_noise)
+    x_louis_fromdata = louis_refine(model, x_data)
 
     with t.no_grad():
         hkr_data = model(x_data).view(-1).cpu().numpy()
         hkr_noise = model(x_noise).view(-1).cpu().numpy()
         hkr_refined = model(x_refined).view(-1).cpu().numpy()
-
-    out_dir = os.path.join(EXP_DIR, 'plots')
-    os.makedirs(out_dir, exist_ok=True)
-    out_png = os.path.join(out_dir, 'hkr_hist_simple.png')
+        hkr_louis_fromnoise = model(x_louis_fromnoise).view(-1).cpu().numpy()
+        hkr_louis_fromdata = model(x_louis_fromdata).view(-1).cpu().numpy()
 
     plt.figure(figsize=(8, 4))
     plt.hist(hkr_data, bins=50, alpha=0.5, label='data')
-    plt.hist(hkr_noise, bins=50, alpha=0.5, label='noise')
+    #plt.hist(hkr_noise, bins=50, alpha=0.5, label='noise')
     plt.hist(hkr_refined, bins=50, alpha=0.5, label='noise refined shortrun')
+    #plt.hist(hkr_louis_fromnoise, bins=50, alpha=0.5, label='noise louis step')
+    #plt.hist(hkr_louis_fromdata, bins=50, alpha=0.5, label='data louis step')
     plt.legend()
     plt.title('HKR values histogram (data / noise / noise refined)')
     plt.tight_layout()
+    out_png = os.path.join(out_dir, 'hkr_hist_simple.png')
     plt.savefig(out_png, dpi=150)
+
+    alphas = t.linspace(0.0, 1.0, 51, device=device)
+    interp_energy = []
+    with t.no_grad():
+        #xdata to xlouis fromdata
+        for alpha in alphas:
+            x_alpha = (1.0 - alpha) * x_data + alpha * x_louis_fromdata
+            interp_energy.append(model(x_alpha).view(-1).mean().item())
+
+        #xlouis fromdata to xlouis fromnoise
+        for alpha in alphas:
+            x_alpha = (1.0 - alpha) * x_louis_fromdata + alpha * x_louis_fromnoise
+            interp_energy.append(model(x_alpha).view(-1).mean().item())
+        #xlouis fromnoise to xnoise
+        for alpha in alphas:
+            x_alpha = (1.0 - alpha) * x_louis_fromnoise + alpha * x_noise
+            interp_energy.append(model(x_alpha).view(-1).mean().item())
+
+    interp_png = os.path.join(out_dir, 'hkr_interpolation_curve.png')
+    plt.figure(figsize=(6, 4))
+    x_axis = list(range(1, len(interp_energy) + 1))
+    plt.plot(x_axis, interp_energy, linewidth=2)
+    plt.xlabel('sample index')
+    plt.ylabel('f(x_alpha)')
+    plt.title('Interpolation entre data -> louis_fromdata -> louis_fromnoise -> noise')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(interp_png, dpi=150)
+
+    interp_frames = []
+    with t.no_grad():
+        # data to xlouis fromdata
+        x_start = x_data[:1]
+        x_end = x_louis_fromdata[:1]
+        for alpha in alphas[::5]:
+            interp_frames.append((1.0 - alpha) * x_start + alpha * x_end)
+
+        # xlouis fromdata to xlouis fromnoise
+        x_start = x_louis_fromdata[:1]
+        x_end = x_louis_fromnoise[:1]
+        for alpha in alphas[::5]:
+            interp_frames.append((1.0 - alpha) * x_start + alpha * x_end)
+        
+        # xlouis fromnoise to xnoise
+        x_start = x_louis_fromnoise[:1]
+        x_end = x_noise[:1]
+        for alpha in alphas[::5]:
+            interp_frames.append((1.0 - alpha) * x_start + alpha * x_end)
+    interp_frames = t.cat(interp_frames, dim=0)
+
+    interp_imgs_png = os.path.join(out_dir, 'hkr_interpolation_frames_line.png')
+    tv.utils.save_image(t.clamp(interp_frames, -1., 1.), interp_imgs_png, normalize=True, nrow=interp_frames.shape[0])
 
     print('Checkpoint:', ckpt_path)
     print('Saved:', out_png)
+    print('Saved:', interp_png)
+    print('Saved:', interp_imgs_png)
+    print('Energy noise:', hkr_noise.mean().item())
+    print('Energy data:', hkr_data.mean().item())
 
-    # Try to do a special refinement : xst=xst - (E_lip(x) + epslion) * grad(E_lip)/(norm(gradElip)^2) for 1 step and plot it
-    x_special = x_noise.clone().detach().requires_grad_(True)
-    energy_lip = model(x_special)
-    grad_lip = t.autograd.grad(energy_lip.sum(), [x_special])[0]
-    print('Energy Lip:', energy_lip.mean().item())
-    step_size = (energy_lip) / (grad_lip.view(grad_lip.size(0), -1).norm(dim=1) ** 2 + 1e-8)
-    x_special_refined = (x_special - step_size.view(-1, 1, 1, 1) * grad_lip).detach()
-    
-    #save the sample refined in a png
-    out_png_special = os.path.join(out_dir, 'hkr_specialfromnoise.png')
-    x_special_refined = x_special_refined[:16]
-    plot_ims(out_png_special, x_special_refined)
-    
-    # do it again but with a loop for 10 steps
-    x_special_refined_loop = x_special.clone().detach().requires_grad_(True)
+    # Try to do a special refinement: one Louis step and plot before/after.
+    print('Energy Lip noise step:', hkr_louis_fromnoise.mean().item())
+    plot_ims(os.path.join(out_dir, 'hkr_specialfromnoise_before.png'), x_noise[:64])
+    plot_ims(os.path.join(out_dir, 'hkr_specialfromnoise.png'), x_louis_fromnoise[:64])
 
-
-    for _ in range(10):
-        energy_lip_loop = model(x_special_refined_loop)
-        print('Energy Lip loop:', energy_lip_loop.mean().item())
-        grad_lip_loop = t.autograd.grad(energy_lip_loop.sum(), [x_special_refined_loop])[0]
-        step_size_loop = (energy_lip_loop) / (grad_lip_loop.view(grad_lip_loop.size(0), -1).norm(dim=1) ** 2 + 1e-8)
-        x_special_refined_loop = (x_special_refined_loop - step_size_loop.view(-1, 1, 1, 1) * grad_lip_loop).detach().requires_grad_(True)
-    
-    #save the sample refined in a png
-    out_png_special_loop = os.path.join(out_dir, 'hkr_specialfromnoise_loop.png')
-    x_special_refined_loop = x_special_refined_loop[:16]
-    plot_ims(out_png_special_loop, x_special_refined_loop)
-
-
-     
-
-    # do the same but from data
-    x_special_data = x_data.clone().detach().requires_grad_(True)
-    energy_lip_data = model(x_special_data)
-    print('Energy Lip data:', energy_lip_data.mean().item())
-    grad_lip_data = t.autograd.grad(energy_lip_data.sum(), [x_special_data])[0]
-    step_size_data = (energy_lip_data) / (grad_lip_data.view(grad_lip_data.size(0), -1).norm(dim=1) ** 2 + 1e-8)
-    x_special_data_refined = (x_special_data - step_size_data.view(-1, 1, 1, 1) * grad_lip_data).detach()
-
-    out_png_special_data = os.path.join(out_dir, 'hkr_specialfromdata.png')
-    x_special_data_refined = x_special_data_refined[:16]
-    plot_ims(out_png_special_data, x_special_data_refined)
-
-    #do the same but with a loop for 10 steps
-    x_special_data_refined_loop = x_special_data.clone().detach().requires_grad_(True)
-    for _ in range(10):
-        energy_lip_data_loop = model(x_special_data_refined_loop)
-        print('Energy Lip data loop:', energy_lip_data_loop.mean().item())
-        grad_lip_data_loop = t.autograd.grad(energy_lip_data_loop.sum(), [x_special_data_refined_loop])[0]
-        step_size_data_loop = (energy_lip_data_loop) / (grad_lip_data_loop.view(grad_lip_data_loop.size(0), -1).norm(dim=1) ** 2 + 1e-8)
-        x_special_data_refined_loop = (x_special_data_refined_loop - step_size_data_loop.view(-1, 1, 1, 1) * grad_lip_data_loop).detach().requires_grad_(True)
-    
-    out_png_special_data_loop = os.path.join(out_dir, 'hkr_specialfromdata_loop.png')
-    x_special_data_refined_loop = x_special_data_refined_loop[:16]
-    plot_ims(out_png_special_data_loop, x_special_data_refined_loop)
-
+    print('Energy Lip data step:', hkr_louis_fromdata.mean().item())
+    plot_ims(os.path.join(out_dir, 'hkr_specialfromdata_before.png'), x_data[:64])
+    plot_ims(os.path.join(out_dir, 'hkr_specialfromdata.png'), x_louis_fromdata[:64])
+   
 
 if __name__ == '__main__':
     main()

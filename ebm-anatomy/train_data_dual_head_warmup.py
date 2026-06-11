@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torchvision.datasets as datasets
 import torchvision.transforms as tr
 from deel import torchlip
+from deel.torchlip.modules.loss import HKRLoss
 
 from utilfid import *
 from utils import download_flowers_data, plot_diagnostics, plot_ims
@@ -22,26 +23,19 @@ from utils import download_flowers_data, plot_diagnostics, plot_ims
 
 # directory for experiment results
 # -----------------------------------------------------------------------------
-EXP_DIR = './out_data/Expe/cifar10_Langevin10_WARMUP/'
+EXP_DIR = './out_data/Expe/cifar10_Langevin10_hard_warmup_05tau1thres/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
-
-# Lipschitz constraint settings
 K_FACTOR = 2.0  # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995  # transition smoothness
-
-# FFT noise settings
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
-# Sigmoid param
-HKR_THRESHOLD = 0.0
-TAU = 1.0
-
-HKR_ALPHA = 0.99 # Hkr loss alpha param
-
-LAMBDA_HKR = 10.0 # Weight for HKR loss in the combined loss 
-HKR_WARMUP_ITERS = 5000 # number iteration with the HKR only
+HKR_ALPHA = 0.99
+LAMBDA_HKR = 10.0 
+HKR_WARMUP_ITERS = 300
+HKR_THRESHOLD = 1.0
+TAU = 0.3
 # -----------------------------------------------------------------------------
 
 
@@ -396,7 +390,7 @@ def sample_s_t(L, init_type, langevin_head, update_s_t_0=True, batch_size=config
 
     return x_s_t.detach(), r_s_t.squeeze() / max(1, L)
 
-
+# For fid longrun
 def langevin_grad(model, x_s_t_0_l, cfg, temp, batch_size, head):
     x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
@@ -503,18 +497,16 @@ hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 for i in range(start_iter, num_train_iters):
     training_mode = 'hkr' if i < HKR_WARMUP_ITERS else 'theta'
 
-    x_q = sample_q() # data samples
+    x_q = sample_q()
     x_s_t, r_s_t = sample_s_t(
         L=num_shortrun_steps,
         init_type=config['shortrun_init'],
         langevin_head=training_mode,
-    ) # negative samples
+    )
 
-    # Compute energies
     ebm_q, hkr_q = f.energy_components(x_q)
     ebm_s, hkr_s = f.energy_components(x_s_t)
 
-    # HKR loss
     f_x_q_hkr = hkr_q.mean()
     f_x_st_hkr = hkr_s.mean()
     kr_term = f_x_q_hkr - f_x_st_hkr
@@ -525,12 +517,10 @@ for i in range(start_iter, num_train_iters):
     ], dim=0).reshape(-1, 1)
     hkr_loss = hkr_loss_fn(hkr_input, hkr_target)
 
-    # EBM loss
     f_x_q_ebm = ebm_q.mean()
     f_x_st_ebm = ebm_s.mean()
     ebm_loss = f_x_q_ebm - f_x_st_ebm
 
-    # warmup with HKR loss only, then switch to combined loss
     if i < HKR_WARMUP_ITERS:
         loss_raw = hkr_loss
         loss_saved = hkr_loss.detach().data.clone()
@@ -538,7 +528,6 @@ for i in range(start_iter, num_train_iters):
         loss_raw = ebm_loss + LAMBDA_HKR*hkr_loss
         loss_saved = loss_raw.detach().data.clone()
 
-    # Scale the loss like we did in the langevin
     if config['epsilon'] > 0:
         d_s_t = loss_raw * 2 / (config['epsilon'] ** 2)
     else:
@@ -548,11 +537,9 @@ for i in range(start_iter, num_train_iters):
     d_s_t.backward()
     optim.step()
 
-    # Update Lipschitz constant if Wasserstein constraint is enabled 
     if WConstrained_enabled and i >= HKR_WARMUP_ITERS:
         current_lip_const = update_lip_const(i, loss=kr_term * r_s_t, grad=r_s_t)
 
-    # Record metrics and fid
     d_s_t_record[i] = loss_saved if loss_saved < 600 else float(600)
     d_s_t_lip_record[i] = hkr_loss.detach()
     d_s_t_nonlip_record[i] = ebm_loss.detach()

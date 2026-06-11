@@ -18,7 +18,7 @@ from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha09/'
+EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha0999_langevinnorm/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
@@ -26,7 +26,8 @@ ALPHA = 0.995 # transition smoothness
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 HKR_LOSS = True
-HKR_ALPHA = 0.99
+HKR_ALPHA = 0.999
+LANGEVIN_SQUARED_NORMALISED = True
 
 #######################
 # ## INITIAL SETUP ## #
@@ -264,7 +265,12 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     for ell in range(L):
         f_val = f(x_s_t)
         f_prime = t.autograd.grad(f_val.sum(), [x_s_t])[0]
-        x_s_t.data += - f_prime + config['epsilon'] * t.randn_like(x_s_t)
+        # / norm^2
+        if LANGEVIN_SQUARED_NORMALISED:
+            f_prime_norm = f_prime / (f_prime.view(f_prime.shape[0], -1).norm(dim=1).pow(2).view(-1, 1, 1, 1) + 1e-8)
+        else :
+            f_prime_norm = f_prime
+        x_s_t.data += - f_prime_norm + config['epsilon'] * t.randn_like(x_s_t)
         r_s_t += f_prime.view(f_prime.shape[0], -1).norm(dim=1).mean()
 
     if init_type == 'persistent' and update_s_t_0:
@@ -288,7 +294,12 @@ def langevin_grad(f, x_s_t_0_l, config,temp,batch_size):
         en = f_val / temp
         ens[ell] = en.detach().cpu()
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
-        x_s_t_l.data += - ((config['epsilon']**2)/2) * grad + config['epsilon'] * t.randn_like(x_s_t_l)
+
+        if LANGEVIN_SQUARED_NORMALISED:
+            grad_norm = grad / (grad.view(grad.shape[0], -1).norm(dim=1).pow(2).view(-1, 1, 1, 1) + 1e-8)
+        else :
+            grad_norm = grad
+        x_s_t_l.data += - ((config['epsilon']**2)/2) * grad_norm + config['epsilon'] * t.randn_like(x_s_t_l)
         grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
 
     return x_s_t_l.detach(), ens, grads
