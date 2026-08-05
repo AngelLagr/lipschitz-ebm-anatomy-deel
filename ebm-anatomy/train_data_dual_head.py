@@ -5,13 +5,17 @@
 import csv
 import json
 import os
+import math
 import random
+from torchsummary import summary
 
 import numpy as np
 import torch as t
 import torch.fft as fft
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib
+import matplotlib.pyplot as plt
 import torchvision.datasets as datasets
 import torchvision.transforms as tr
 from deel import torchlip
@@ -21,22 +25,33 @@ from utilfid import *
 from utils import download_flowers_data, plot_diagnostics, plot_ims
 
 
-# directory for experiment results
 # -----------------------------------------------------------------------------
-EXP_DIR = './out_data/Expe/cifar10_Langevin10_hard_warmup_05tau1thres/'
+EXP_DIR = './out_data/Expe/cifar10_Langevin10_only_negative_forebm_regul_0001/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
-K_FACTOR = 2.0  # factor to scale the Lipschitz constant for the K constraint
-ALPHA = 0.995  # transition smoothness
+
+WARMSTEPINIT = False
+LOUIS_STEPSREINIT = False
+NUMBER_OF_LOUIS_STEPS = 1
+
+LOSS_NORM = True
+REGUL_WEIGHT = 1e-4 # Regularization weight for EBM loss
+ONLY_NEGATIVE_FOR_EBM_LOSS = False
+
+BIG_HEAD_NONLIP = False
+
+# FFT noise settings
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
-HKR_ALPHA = 0.99
-LAMBDA_HKR = 10.0 
-HKR_WARMUP_ITERS = 300
-HKR_THRESHOLD = 1.0
-TAU = 0.3
+# Sigmoid param
+HKR_THRESHOLD = 0.5
+TAU = 0.2
+
+HKR_ALPHA = 0.999 # Hkr loss alpha param
+GRAD_PLOT = False # Plots param gradient norms for each component of the model (feature extractor, hkr head, ebm head)
 # -----------------------------------------------------------------------------
+
 
 
 #######################
@@ -48,6 +63,18 @@ class Identity(nn.Module):
     def forward(self, x):
         return x
 
+def get_norm(n_filters, norm):
+    if norm is None:
+        return Identity()
+    elif norm == "batch":
+        return nn.BatchNorm2d(n_filters, momentum=0.9)
+    elif norm == "instance":
+        return nn.InstanceNorm2d(n_filters, affine=True)
+    elif norm == "layer":
+        return nn.GroupNorm(1, n_filters)
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=True)
 
 def conv3x3_lip(in_planes, out_planes, stride=1):
     return torchlip.SpectralConv2d(
@@ -58,6 +85,26 @@ def conv3x3_lip(in_planes, out_planes, stride=1):
         padding=1,
         bias=True,
     )
+class wide_basic(nn.Module):
+    def __init__(self, in_planes, planes, stride=1, norm=None, leak=0.2):
+        super().__init__()
+        self.lrelu = nn.LeakyReLU(leak)
+        self.bn1   = get_norm(in_planes, norm)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, padding=1, bias=True)
+        self.bn2   = get_norm(planes, norm)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=True)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=True)
+            )
+
+    def forward(self, x):
+        out = self.conv1(self.lrelu(self.bn1(x)))
+        out = self.conv2(self.lrelu(self.bn2(out)))
+        out += self.shortcut(x)
+        return out
 
 
 class wide_basic_lip(nn.Module):
@@ -83,6 +130,17 @@ class wide_basic_lip(nn.Module):
         out = (out + self.lip_residual(out, self.shortcut(x))) / 2
         return out
 
+class ResMLPBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.act = nn.LeakyReLU(0.05)
+
+    def forward(self, x):
+        out = self.act(self.fc1(x))
+        out = self.fc2(out)
+        return self.act(x + out)
 
 class DualHeadLipEBM(nn.Module):
     def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, lip_const=1.0, hkr_switch_threshold=0.0, hkr_tau=0.1):
@@ -97,6 +155,7 @@ class DualHeadLipEBM(nn.Module):
         k = widen_factor
         n_stages = [16, 16 * k, 32 * k, 64 * k]
 
+        # activation nonlip : Gelu
         self.activation = torchlip.GroupSort2()
         self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
 
@@ -116,14 +175,29 @@ class DualHeadLipEBM(nn.Module):
             layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
             layers.append(torchlip.GroupSort2())
             layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
-            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.GroupSort2())            
             layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(out_dim, 1))
+            
         else:
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.05))
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.05))
-            layers.append(nn.Linear(hidden_dim, out_dim))
+            if BIG_HEAD_NONLIP:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(nn.LeakyReLU(0.05))
+                layers += [ResMLPBlock(hidden_dim) for _ in range(3)]
+                layers.append(nn.Linear(hidden_dim, out_dim))
+                layers.append(nn.LeakyReLU(0.05))
+                layers.append(nn.Linear(out_dim, 1))
+
+            else:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(nn.LeakyReLU(0.05))
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                layers.append(nn.LeakyReLU(0.05))
+                layers.append(nn.Linear(hidden_dim, out_dim))
+                layers.append(nn.LeakyReLU(0.05))
+                layers.append(nn.Linear(out_dim, 1))
+            
         return nn.Sequential(*layers)
 
     def _wide_layer(self, planes, num_blocks, stride):
@@ -131,6 +205,13 @@ class DualHeadLipEBM(nn.Module):
         layers = []
         for s in strides:
             layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+    def _wide_layer_nonlip(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic(self.in_planes, planes, stride=s))
             self.in_planes = planes
         return nn.Sequential(*layers)
 
@@ -146,10 +227,10 @@ class DualHeadLipEBM(nn.Module):
 
     def energy_components(self, x):
         h = self.features(x)
-        hkr_logits = self.hkr_head(h)
-        ebm_logits = self.ebm_head(h)
-        hkr_energy = self.lip_const * hkr_logits.logsumexp(1)
-        ebm_energy = ebm_logits.logsumexp(1)
+        hkr_value = self.hkr_head(h)
+        ebm_value = self.ebm_head(h)
+        hkr_energy = self.lip_const * hkr_value
+        ebm_energy = ebm_value
         return ebm_energy, hkr_energy
 
     def forward(self, x, head='theta'):
@@ -240,32 +321,27 @@ f = DualHeadLipEBM(
     hkr_tau=TAU,
 ).to(device)
 
-current_lip_const = None
-WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
+summary(f, (3, 32, 32))
 
-def update_lip_const(iteration_idx, loss=None, grad=None):
-    lip_const = f.lip_const
-    if not WConstrained_enabled:
-        return None
 
-    if WConstrained_enabled and grad is not None and loss is not None:
-        print(f"Current Lip_const: {lip_const:.4f}")
-
-        new_lip = abs(loss)/(((grad**2)/lip_const + 1e-8) * config['num_shortrun_steps']) 
-        new_lip = K_FACTOR * new_lip
-        new_lip_const = ALPHA*lip_const + (1-ALPHA)*new_lip
-    else:
-        new_lip_const = lip_const
-
-    f.lip_const = float(new_lip_const)
-    return f.lip_const
+def collect_params(*modules):
+    params = []
+    for module in modules:
+        params.extend([p for p in module.parameters() if p.requires_grad])
+    return tuple(params)
 
 
 optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
 if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0:
     config['lr_init'] *= (config['epsilon'] ** 2) / 2
     config['lr_min'] *= (config['epsilon'] ** 2) / 2
-optim = optim_bank[config['optimizer_type']](f.parameters(), lr=config['lr_init'])
+feature_params = collect_params(f.conv1, f.layer1, f.layer2, f.layer3, f.bn1, f.activation, f.lipavgpool2d)
+lip_head_params = collect_params(f.hkr_head)
+nonlip_head_params = collect_params(f.ebm_head)
+hkr_params = feature_params + lip_head_params  # conservé pour les grad norms
+ebm_params = feature_params + nonlip_head_params  # conservé pour les grad norms
+all_params = feature_params + lip_head_params + nonlip_head_params
+optim = optim_bank[config['optimizer_type']](all_params, lr=config['lr_init'])
 
 print('Processing data...')
 if config['data'] == 'flowers':
@@ -347,20 +423,55 @@ def sample_q(batch_size=config['batch_size']):
     x_q = sample_image_set(q, batch_size=batch_size)[0]
     return x_q + config['data_epsilon'] * t.randn_like(x_q)
 
+def louis_steps(model, x0, iters=1, noise_eps=0.015):
+    x = x0.clone().detach().requires_grad_(True)
 
-def sample_s_t(L, init_type, langevin_head, update_s_t_0=True, batch_size=config['batch_size']):
+    for _ in range(iters):
+        energy_lip = model(x, head='hkr') 
+        grad_lip = t.autograd.grad(energy_lip.sum(), [x])[0]
+
+        energy_per_sample = t.clamp(energy_lip - HKR_THRESHOLD, min=0.0).view(x.size(0))
+        grad_norm_lip = grad_lip.view(x.size(0), -1).norm(dim=1) ** 2 + 1e-8
+
+        step_size = (noise_eps * t.randn_like(energy_per_sample) + energy_per_sample) / grad_norm_lip
+        x = (x - step_size.view(-1, 1, 1, 1) * grad_lip).detach().requires_grad_(True)
+
+
+    return x.detach()
+
+
+def sample_s_t(L, init_type, langevin_head, update_s_t_0=True, batch_size=config['batch_size'], idx=0):
     def sample_s_t_0():
         if init_type == 'persistent':
             mask = t.rand(batch_size, device=device) < RANDOMRATE
             indices = t.randperm(s_t_0.shape[0], device=device)[:batch_size]
             persistent_samples = s_t_0[indices]
 
-            if FFT_NOISE:
-                random_samples = sample_freq_noise(batch_size, band='mixed')
-            else:
-                random_samples = 2 * t.rand([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
+            # Seulement les positions qui vont recevoir un sample aléatoire
+            num_new = (~mask).sum().item()
 
-            x_s_t_0 = t.where(mask.view(-1, 1, 1, 1), persistent_samples, random_samples)
+            # Guard : si rien à remplacer, retourner directement
+            if num_new == 0:
+                return persistent_samples.clone(), indices.clone()
+
+            if FFT_NOISE:
+                random_samples = sample_freq_noise(num_new, band='mixed')
+            else:
+                random_samples = 2 * t.rand([num_new, config['im_ch'], config['im_sz'], config['im_sz']], device=device) - 1
+
+            if LOUIS_STEPSREINIT:
+                random_samples = louis_steps(model=f, x0=random_samples.clone(), iters=NUMBER_OF_LOUIS_STEPS, noise_eps=config['epsilon'])
+            elif WARMSTEPINIT:
+                buffersize = 60000 if config['data'] == 'mnist' else 50000
+                langevin_steps_remaining_in_buffer = config['num_shortrun_steps']/(1-RANDOMRATE) - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**idx)
+                num_steps_seen = min(50, int(200 - langevin_steps_remaining_in_buffer))
+                print(f"Warmstepinit: num_steps_seen={num_steps_seen} for idx={idx}")
+                random_samples = hkr_only_langevin_grad(model=f, x_s_t_0_l=random_samples.clone(), num_steps=num_steps_seen, cfg=config, temp=1.0)
+
+            # Assemblage : persistent par défaut, random_samples là où mask=False
+            x_s_t_0 = persistent_samples.clone()
+            x_s_t_0[~mask] = random_samples.clone()
+
             return x_s_t_0, indices.clone()
 
         if init_type == 'data':
@@ -381,7 +492,8 @@ def sample_s_t(L, init_type, langevin_head, update_s_t_0=True, batch_size=config
     x_s_t = t.autograd.Variable(x_s_t_0.clone(), requires_grad=True)
     r_s_t = t.zeros(1).to(device)
     for _ in range(L):
-        f_prime = t.autograd.grad(f(x_s_t, head=langevin_head).sum(), [x_s_t])[0]
+        energy = f(x_s_t, head=langevin_head)
+        f_prime = t.autograd.grad(energy.sum(), [x_s_t])[0]
         x_s_t.data += -f_prime + config['epsilon'] * t.randn_like(x_s_t)
         r_s_t += f_prime.view(f_prime.shape[0], -1).norm(dim=1).mean()
 
@@ -390,7 +502,7 @@ def sample_s_t(L, init_type, langevin_head, update_s_t_0=True, batch_size=config
 
     return x_s_t.detach(), r_s_t.squeeze() / max(1, L)
 
-# For fid longrun
+
 def langevin_grad(model, x_s_t_0_l, cfg, temp, batch_size, head):
     x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
@@ -399,13 +511,21 @@ def langevin_grad(model, x_s_t_0_l, cfg, temp, batch_size, head):
 
     for ell in range(cfg['num_longrun_steps']):
         en = model(x_s_t_l, head=head) / temp
-        ens[ell] = en.detach().cpu()
+        ens[ell] = en.detach().cpu().squeeze(-1)         
         grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
-        x_s_t_l.data += -((cfg['epsilon'] ** 2) / 2) * grad + cfg['epsilon'] * t.randn_like(x_s_t_l)
-        grads[ell] = ((cfg['epsilon'] ** 2) / 2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        x_s_t_l.data += -grad + cfg['epsilon'] * t.randn_like(x_s_t_l)
+        grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
 
     return x_s_t_l.detach(), ens, grads
+def hkr_only_langevin_grad(model, x_s_t_0_l,num_steps, cfg, temp):
+    x_s_t_l = t.autograd.Variable(x_s_t_0_l.clone(), requires_grad=True)
 
+    for ell in range(num_steps):
+        en = model(x_s_t_l, head='hkr') / temp
+        grad = t.autograd.grad(en.sum(), [x_s_t_l])[0]
+        x_s_t_l.data += -grad + cfg['epsilon'] * t.randn_like(x_s_t_l)
+
+    return x_s_t_l.detach()
 
 def sample_s_tlongrun(model, cfg, device, init_type, batch_size, head):
     if init_type == 'uniform':
@@ -417,7 +537,19 @@ def sample_s_tlongrun(model, cfg, device, init_type, batch_size, head):
     else:
         raise RuntimeError('Invalid method for "init_type" (use "uniform", "gaussian", or "fft")')
 
-    x_s_t_l = langevin_grad(model, x_s_t_0_l.clone(), cfg, (cfg['epsilon'] ** 2) / 2, batch_size, head=head)[0]
+    #if LOUIS_STEPSREINIT:
+    #    x_s_t_0_l = louis_steps(model=model, x0=x_s_t_0_l, iters=NUMBER_OF_LOUIS_STEPS, noise_eps=cfg['epsilon'])
+    #elif WARMSTEPINIT:
+    #    x_s_t_0_l = hkr_only_langevin_grad(model=model, x_s_t_0_l=x_s_t_0_l.clone(), num_steps=50, cfg=cfg, temp=1.0)
+
+    x_s_t_l = langevin_grad(
+        model,
+        x_s_t_0_l.clone(),
+        cfg,
+        1.0,
+        batch_size,
+        head=head,
+    )[0]
     return x_s_t_l.detach()
 
 
@@ -427,7 +559,6 @@ def sample_s_tlongrun(model, cfg, device, init_type, batch_size, head):
 
 
 num_train_iters = config['num_train_iters']
-
 d_s_t_record = t.zeros(num_train_iters).to(device)
 r_s_t_record = t.zeros(num_train_iters).to(device)
 fid_record = t.zeros(num_train_iters).to(device)
@@ -435,13 +566,16 @@ fid_record[:] = float('nan')
 instability_record = t.zeros(num_train_iters).to(device)
 instability_record[:] = float('nan')
 fid_score = float('nan')
-lip_const_record = t.zeros(num_train_iters).to(device)
-lip_const_record[:] = float('nan')
 f_x_q_record = t.zeros(num_train_iters).to(device)
 f_x_st_record = t.zeros(num_train_iters).to(device)
 
 d_s_t_lip_record = t.zeros(num_train_iters).to(device)
 d_s_t_nonlip_record = t.zeros(num_train_iters).to(device)
+feature_grad_record = t.zeros(num_train_iters).to(device)
+lip_head_grad_record = t.zeros(num_train_iters).to(device)
+nonlip_head_grad_record = t.zeros(num_train_iters).to(device)
+ebm_loss_grad_record = t.zeros(num_train_iters).to(device)
+hkr_loss_grad_record = t.zeros(num_train_iters).to(device)
 
 csv_file_path = EXP_DIR + 'plots/' + 'training_metrics.csv'
 last_csv_written = 0
@@ -469,7 +603,6 @@ def save_full_checkpoint(iteration_idx, training_mode, energy_mode, current_step
         'fid_score': float(fid_score),
         'last_csv_written': last_csv_written,
         'config': config,
-        'lip_const_record': lip_const_record[:iter_done].detach().cpu(),
     }
     t.save(checkpoint, EXP_DIR + 'checkpoints/' + 'last_checkpoint.pth')
 
@@ -490,23 +623,89 @@ def compute_instability_index(i):
     return 0.5 * (fxst_cv + fxq_cv)
 
 
+
+def grad_norm_from_loss(loss, params):
+    grads = t.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    norm_sq = t.zeros((), device=device)
+    for grad in grads:
+        if grad is not None:
+            norm_sq = norm_sq + grad.detach().pow(2).sum()
+    return t.sqrt(norm_sq)
+
+
+def grad_norm_from_module(params):
+    norm_sq = t.zeros((), device=device)
+    has_grad = False
+    for param in params:
+        if param.grad is not None:
+            norm_sq = norm_sq + param.grad.detach().pow(2).sum()
+            has_grad = True
+    return t.sqrt(norm_sq) if has_grad else t.tensor(float('nan'), device=device)
+
+
+def plot_gradient_diagnostics(batch, feat_record, lip_record, nonlip_record, ebm_record, hkr_record, exp_dir):
+    matplotlib.rc('xtick', labelsize=8)
+    matplotlib.rc('ytick', labelsize=8)
+    fig = plt.figure(figsize=(12, 6))
+
+    ax = fig.add_subplot(211)
+    ax.plot(feat_record[: batch + 1].detach().cpu().numpy(), label='features')
+    ax.plot(lip_record[: batch + 1].detach().cpu().numpy(), label='lip head')
+    ax.plot(nonlip_record[: batch + 1].detach().cpu().numpy(), label='non-lip head')
+    ax.set_title('Optimizer gradient norms', fontsize=10)
+    ax.set_xlabel('batch', fontsize=10)
+    ax.set_ylabel('grad norm', fontsize=10)
+    ax.legend(fontsize=8, loc='best')
+
+    ax = fig.add_subplot(212)
+    ax.plot(ebm_record[: batch + 1].detach().cpu().numpy(), label='EBM loss')
+    ax.plot(hkr_record[: batch + 1].detach().cpu().numpy(), label='HKR loss')
+    ax.set_title('Loss gradient norms', fontsize=10)
+    ax.set_xlabel('batch', fontsize=10)
+    ax.set_ylabel('grad norm', fontsize=10)
+    ax.legend(fontsize=8, loc='best')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(exp_dir, 'gradients_plot.png'))
+    plt.close(fig)
+
+
 print('Training has started.')
 num_shortrun_steps = config['num_shortrun_steps']
 hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 
 for i in range(start_iter, num_train_iters):
-    training_mode = 'hkr' if i < HKR_WARMUP_ITERS else 'theta'
+    training_mode = 'curriculum'
 
-    x_q = sample_q()
+    x_q = sample_q() # data samples
     x_s_t, r_s_t = sample_s_t(
         L=num_shortrun_steps,
         init_type=config['shortrun_init'],
-        langevin_head=training_mode,
-    )
+        langevin_head='theta',
+        idx=i,
+    ) # negative samples
 
-    ebm_q, hkr_q = f.energy_components(x_q)
-    ebm_s, hkr_s = f.energy_components(x_s_t)
+    # Shared feature extractor for HKR, detached features for EBM.
+    h_q = f.features(x_q)
+    h_s = f.features(x_s_t)
+    hkr_q = f.hkr_head(h_q)
+    hkr_s = f.hkr_head(h_s)
 
+    # if activated only uses samples with hkr < threshold for the ebm loss
+    if ONLY_NEGATIVE_FOR_EBM_LOSS:
+        mask_q = (hkr_q < HKR_THRESHOLD).squeeze()
+        mask_s = (hkr_s < HKR_THRESHOLD).squeeze()
+        h_q = h_q[mask_q]
+        h_s = h_s[mask_s]
+
+    if h_q.shape[0] == 0 or h_s.shape[0] == 0:
+        ebm_q = t.zeros(1, device=device, requires_grad=True)
+        ebm_s = t.zeros(1, device=device, requires_grad=True)
+    else :
+        ebm_q = f.ebm_head(h_q)
+        ebm_s = f.ebm_head(h_s)
+
+    # HKR loss
     f_x_q_hkr = hkr_q.mean()
     f_x_st_hkr = hkr_s.mean()
     kr_term = f_x_q_hkr - f_x_st_hkr
@@ -521,41 +720,53 @@ for i in range(start_iter, num_train_iters):
     f_x_st_ebm = ebm_s.mean()
     ebm_loss = f_x_q_ebm - f_x_st_ebm
 
-    if i < HKR_WARMUP_ITERS:
-        loss_raw = hkr_loss
-        loss_saved = hkr_loss.detach().data.clone()
-    else:
-        loss_raw = ebm_loss + LAMBDA_HKR*hkr_loss
-        loss_saved = loss_raw.detach().data.clone()
+    #NORM LOSS
+    ebm_loss = ebm_loss + REGUL_WEIGHT * (ebm_q.pow(2).mean() + ebm_s.pow(2).mean())
 
-    if config['epsilon'] > 0:
-        d_s_t = loss_raw * 2 / (config['epsilon'] ** 2)
+
+    if LOSS_NORM:
+        hkr_loss_grad = grad_norm_from_loss(hkr_loss, hkr_params)
+        ebm_loss_grad = grad_norm_from_loss(ebm_loss, ebm_params)
+        hkr_loss_grad_record[i] = hkr_loss_grad
+        ebm_loss_grad_record[i] = ebm_loss_grad
+
+        ratio = (hkr_loss_grad / (ebm_loss_grad + 1e-8)).detach()
+        ebm_loss_norm = ebm_loss * ratio
     else:
-        d_s_t = loss_raw
+        ebm_loss_norm = ebm_loss
+    loss_raw = hkr_loss + ebm_loss_norm
+    loss_saved = loss_raw.detach().data.clone()
+
+    d_s_t = loss_raw
 
     optim.zero_grad()
-    d_s_t.backward()
+    loss_raw.backward()
     optim.step()
 
-    if WConstrained_enabled and i >= HKR_WARMUP_ITERS:
-        current_lip_const = update_lip_const(i, loss=kr_term * r_s_t, grad=r_s_t)
+    if GRAD_PLOT:
+        feature_grad_record[i] = grad_norm_from_module(feature_params)
+        lip_head_grad_record[i] = grad_norm_from_module(lip_head_params)
+        nonlip_head_grad_record[i] = grad_norm_from_module(nonlip_head_params)
 
+    
+    # Record metrics and fid
     d_s_t_record[i] = loss_saved if loss_saved < 600 else float(600)
     d_s_t_lip_record[i] = hkr_loss.detach()
-    d_s_t_nonlip_record[i] = ebm_loss.detach()
+    d_s_t_nonlip_record[i] = ebm_loss_norm.detach()
     r_s_t_record[i] = r_s_t
 
-    if WConstrained_enabled:
-        lip_const_record[i] = current_lip_const if current_lip_const is not None else float('nan')
+    
+    fxq_true = f(x_q, head='theta').mean().detach()
+    fxst_true = f(x_s_t, head='theta').mean().detach()
+    f_x_q_record[i] = (fxq_true).detach()
+    f_x_st_record[i] = (fxst_true).detach()
 
-    if i < HKR_WARMUP_ITERS:
-        f_x_q_record[i] = f_x_q_hkr.detach()
-        f_x_st_record[i] = f_x_st_hkr.detach()
-    else:
-        f_x_q_record[i] = f_x_q_ebm.detach()
-        f_x_st_record[i] = f_x_st_ebm.detach()
-
-    print(f"Iteration {i+1}: mode={training_mode}, f(x_q)={f_x_q_record[i]:.4f}, f(x_s_t)={f_x_st_record[i]:.4f}, fhkr(x_q)={f_x_q_hkr:.4f}, fhkr(x_s_t)={f_x_st_hkr:.4f}")
+    print(
+        f"Iteration {i+1}: mode={training_mode}, "
+        f"f(x_q)={f_x_q_record[i]:.4f}, f(x_s_t)={f_x_st_record[i]:.4f}, "
+        f"f_ebm(x_q)={f_x_q_ebm:.4f}, f_ebm(x_s_t)={f_x_st_ebm:.4f}, "
+        f"fhkr(x_q)={f_x_q_hkr:.4f}, fhkr(x_s_t)={f_x_st_hkr:.4f}"
+    )
     instability_record[i] = compute_instability_index(i)
 
     if feature_extractor is not None and (i == 0 or (i + 1) % config.get('log_freq', 100) == 0):
@@ -571,7 +782,7 @@ for i in range(start_iter, num_train_iters):
                     device,
                     init_type='fft',
                     batch_size=fid_batch_size,
-                    head='theta' if i >= HKR_WARMUP_ITERS else 'hkr',
+                    head='theta',
                 )
             else:
                 x_s_t_fid = sample_s_tlongrun(
@@ -580,7 +791,7 @@ for i in range(start_iter, num_train_iters):
                     device,
                     init_type='uniform',
                     batch_size=fid_batch_size,
-                    head='theta' if i >= HKR_WARMUP_ITERS else 'hkr',
+                    head='theta',
                 )
             fid_score = compute_fid_batch(x_q_fid, x_s_t_fid, feature_extractor, config['data'] == 'cifar10')
             if fid_score > 500:
@@ -601,8 +812,16 @@ for i in range(start_iter, num_train_iters):
             fid_score,
         )
     )
-    if current_lip_const is not None:
-        print('{:>6d}   Lip_const={:>14.9f}'.format(i + 1, current_lip_const))
+    if GRAD_PLOT :
+        plot_gradient_diagnostics(
+            i,
+            feature_grad_record,
+            lip_head_grad_record,
+            nonlip_head_grad_record,
+            ebm_loss_grad_record,
+            hkr_loss_grad_record,
+            EXP_DIR + 'plots/',
+        )
 
     if ((i + 1) % config['log_freq'] == 0) or ((i + 1) == num_train_iters):
         csv_exists = os.path.exists(csv_file_path)
@@ -621,15 +840,13 @@ for i in range(start_iter, num_train_iters):
                         'Instability',
                         'fxq',
                         'fxst',
-                        'Lip_const',
                     ]
                 )
             for j in range(last_csv_written, i + 1):
-                mode_j = 'hkr' if j < HKR_WARMUP_ITERS else 'theta'
                 csv_writer.writerow(
                     [
                         j + 1,
-                        mode_j,
+                        training_mode,
                         float(fid_record[j].detach().cpu()),
                         float(d_s_t_record[j].detach().cpu()),
                         float(d_s_t_lip_record[j].detach().cpu()),
@@ -638,7 +855,6 @@ for i in range(start_iter, num_train_iters):
                         float(instability_record[j].detach().cpu()),
                         float(f_x_q_record[j].detach().cpu()),
                         float(f_x_st_record[j].detach().cpu()),
-                        float(lip_const_record[j].detach().cpu()),
                     ]
                 )
         last_csv_written = i + 1
@@ -651,7 +867,7 @@ for i in range(start_iter, num_train_iters):
         save_full_checkpoint(
             i,
             training_mode=training_mode,
-            energy_mode='theta' if i >= HKR_WARMUP_ITERS else 'hkr',
+            energy_mode='static',
             current_steps=num_shortrun_steps,
         )
 
@@ -672,8 +888,9 @@ for i in range(start_iter, num_train_iters):
         x_p_theta = sample_s_t(
             L=config['num_longrun_steps'],
             init_type=config['longrun_init'],
-            langevin_head='theta' if i >= HKR_WARMUP_ITERS else 'hkr',
+            langevin_head='theta',
             update_s_t_0=False,
+            idx=i
         )[0]
         plot_ims(EXP_DIR + 'longrun/' + 'longrun_{:>06d}.png'.format(i + 1), x_p_theta)
         print('{:>6d}   Long-run samples saved.'.format(i + 1))

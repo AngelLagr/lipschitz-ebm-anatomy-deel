@@ -18,16 +18,20 @@ from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_lip_lang10_HKR_REAL_alpha0999_langevinnorm/'
-CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
+EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10_nofft_lr3e-6/'
+CONFIG_FILE = './config_locker/cifar10_Langevin10_semihalfLipDu3FFT.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995 # transition smoothness
-FFT_NOISE = True
+FFT_NOISE = False
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
-HKR_LOSS = True
+HKR_LOSS = False
+REGULARIZE = False
+REGUL_WEIGHT = 5e-3
 HKR_ALPHA = 0.999
-LANGEVIN_SQUARED_NORMALISED = True
+LANGEVIN_SQUARED_NORMALISED = False
+
+DST_SCALED = False
 
 #######################
 # ## INITIAL SETUP ## #
@@ -75,7 +79,10 @@ random.seed(config['seed'])
 start_iter = 0
 
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
-
+if DST_SCALED:
+    temp = 1* (config['epsilon'] ** 2) / 2
+else:
+    temp = 1
 # Initialize FID feature extractor for MNIST
 if config['data'] == 'mnist':
     feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature_extractor.pth', device)
@@ -91,23 +98,21 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet,'wideresnetSoftplus': Wide_ResNetSoftPlus, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLipSoftplus": Wide_ResNet_LLipSoftPlus, "orthogonium": VanillaNetOrthogonium}
-if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium"):
+net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel,'testinv': TestInvModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
+if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium","test","testinv", "semihalf","bigtest"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
-    current_lip_const=None
+    print(f"Initialized {config['net_type']} with Lip_const={config['Lip_const']}")
 elif (config['net_type']=="wideresnet22"):
     f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
-    current_lip_const=None
 elif (config['net_type']=="wideresnet34"):
     f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 34).to(device)
-    current_lip_const=None
 elif (config['net_type']=="wideresnetLip22"):
     f = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'],depth = 22).to(device)
 else :
     f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
-    current_lip_const=None
 
 hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
+current_lip_const=None
 
 WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
 WLang_ratio = float(config.get('WLang_ratio', 0.1))
@@ -145,11 +150,13 @@ def update_lip_const(iteration_idx, loss=None, grad=None):
 
 # set up optimizer
 optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
-if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0:
+if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0 and DST_SCALED:
     # scale learning rate according to langevin noise for invariant tuning
     config['lr_init'] *= (config['epsilon'] ** 2) / 2
     config['lr_min'] *= (config['epsilon'] ** 2) / 2
 optim = optim_bank[config['optimizer_type']](f.parameters(), lr=config['lr_init'])
+
+
 
 print('Processing data...')
 # make tensor of training data
@@ -270,9 +277,11 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
             f_prime_norm = f_prime / (f_prime.view(f_prime.shape[0], -1).norm(dim=1).pow(2).view(-1, 1, 1, 1) + 1e-8)
         else :
             f_prime_norm = f_prime
+
+        
         x_s_t.data += - f_prime_norm + config['epsilon'] * t.randn_like(x_s_t)
         r_s_t += f_prime.view(f_prime.shape[0], -1).norm(dim=1).mean()
-
+        
     if init_type == 'persistent' and update_s_t_0:
         # update persistent image bank
         s_t_0.data[s_t_0_inds] = x_s_t.detach().data.clone()
@@ -299,8 +308,13 @@ def langevin_grad(f, x_s_t_0_l, config,temp,batch_size):
             grad_norm = grad / (grad.view(grad.shape[0], -1).norm(dim=1).pow(2).view(-1, 1, 1, 1) + 1e-8)
         else :
             grad_norm = grad
-        x_s_t_l.data += - ((config['epsilon']**2)/2) * grad_norm + config['epsilon'] * t.randn_like(x_s_t_l)
-        grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        
+        if DST_SCALED:
+            x_s_t_l.data += - ((config['epsilon']**2)/2) * grad_norm + config['epsilon'] * t.randn_like(x_s_t_l)
+            grads[ell] = ((config['epsilon']**2)/2) * grad.view(grad.shape[0], -1).norm(dim=1).cpu()
+        else:
+            x_s_t_l.data += - grad_norm + config['epsilon'] * t.randn_like(x_s_t_l)
+            grads[ell] = grad.view(grad.shape[0], -1).norm(dim=1).cpu()
 
     return x_s_t_l.detach(), ens, grads
 
@@ -316,7 +330,7 @@ def sample_s_tlongrun(f, config, device, init_type, batch_size):
 
     x_s_t_l = x_s_t_0_l.clone()
     
-    x_s_t_l = langevin_grad(f, x_s_t_l, config, (config['epsilon'] ** 2) / 2, batch_size)[0]
+    x_s_t_l = langevin_grad(f, x_s_t_l, config, temp, batch_size)[0]
         
 
     return x_s_t_l.detach()
@@ -405,13 +419,18 @@ for i in range(start_iter, config['num_train_iters']):
         loss_raw = hkr_loss_fn(hkr_input, hkr_target)
         loss_saved = loss_raw.detach().clone()
     else:
-        f_x_q = f_x_q_all.mean()
-        f_x_st = f_x_st_all.mean()
+        f_x_q = logits_q.mean()
+        f_x_st = logits_s.mean()
         loss_raw = f_x_q - f_x_st
+
+        if REGULARIZE:
+            reg_term =  (logits_q.pow(2).mean() + logits_s.pow(2).mean())
+            loss_raw += REGUL_WEIGHT * reg_term
+
         loss_saved = loss_raw.detach().data.clone()
 
     # scale loss with the langevin implementation if needed
-    if config['epsilon'] > 0:
+    if DST_SCALED:
         d_s_t = loss_raw * 2 / (config['epsilon'] ** 2)
     else:
         d_s_t = loss_raw

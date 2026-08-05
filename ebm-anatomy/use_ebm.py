@@ -37,6 +37,5 @@ img_tensor = transform(Image.open(LONGRUN_IMAGE_PATH).convert(mode)).unsqueeze(0
 with t.no_grad():
     energy = model(img_tensor)
 
-
 print(f'Energy: {float(energy):.6f}')
 

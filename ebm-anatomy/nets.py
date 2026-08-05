@@ -385,48 +385,6 @@ class Wide_ResNet(nn.Module):
 
 
 
-class Wide_ResNetSoftPlus(nn.Module):
-    def __init__(self, depth=16, widen_factor=2, n_c=3, norm=None, leak=0.2, n_classes=10):
-        super().__init__()
-        self.lrelu    = nn.LeakyReLU(leak)
-        self.in_planes = 16
-
-        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
-        n = (depth - 4) // 6
-        k = widen_factor
-        nStages = [16, 16*k, 32*k, 64*k]
-
-        self.conv1  = conv3x3(n_c, nStages[0])
-        self.layer1 = self._wide_layer(nStages[1], n, stride=1, norm=norm, leak=leak)
-        self.layer2 = self._wide_layer(nStages[2], n, stride=2, norm=norm, leak=leak)
-        self.layer3 = self._wide_layer(nStages[3], n, stride=2, norm=norm, leak=leak)
-        self.bn1    = get_norm(nStages[3], norm)
-        self.linear = nn.Linear(nStages[3], n_classes)
-        self.softplus = nn.Softplus()
-
-    def _wide_layer(self, planes, num_blocks, stride, norm, leak):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers  = []
-        for s in strides:
-            layers.append(wide_basic(self.in_planes, planes, stride=s, norm=norm, leak=leak))
-            self.in_planes = planes
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.lrelu(self.bn1(out))
-        out = F.avg_pool2d(out, 8)
-        out = out.view(out.size(0), -1)
-        logits = self.linear(out)
-        return self.softplus(logits).logsumexp(1)          # scalar energy per sample → (B,)
-
-
-
-
-
 
 
 
@@ -461,6 +419,7 @@ class wide_basic_lip(nn.Module):
                                         stride=stride, padding=0, bias=True),
             )
 
+
     def forward(self, x):
         out = self.conv1(self.act(self.bn1(x)))    
         out = self.conv2(self.act(self.bn2(out))) 
@@ -493,6 +452,7 @@ class Wide_ResNet_LLip(nn.Module):
         self.bn1 = Identity()
         
         self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
 
     def _wide_layer(self, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -517,9 +477,12 @@ class Wide_ResNet_LLip(nn.Module):
         out = out.view(out.size(0), -1)
         
         logits = self.linear(out)
-        return self.Lip_const * logits.logsumexp(1)
+        energy = self.linear_energy(logits)
+        return self.Lip_const * energy.squeeze()     
 
-class Wide_ResNet_LLipSoftPlus(nn.Module):
+
+
+class Wide_ResNet_LLip_Logsumexp(nn.Module):
     def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
         super().__init__()
         self.Lip_const = Lip_const
@@ -545,7 +508,6 @@ class Wide_ResNet_LLipSoftPlus(nn.Module):
         self.bn1 = Identity()
         
         self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
-        self.softplus = nn.Softplus()
 
     def _wide_layer(self, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -570,4 +532,377 @@ class Wide_ResNet_LLipSoftPlus(nn.Module):
         out = out.view(out.size(0), -1)
         
         logits = self.linear(out)
-        return self.Lip_const * self.softplus(logits).logsumexp(1)
+        return self.Lip_const * logits.logsumexp(1) 
+
+
+
+class Wide_ResNet_LLip(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
+        super().__init__()
+        self.Lip_const = Lip_const
+
+        self.activation = torchlip.GroupSort2()
+        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        n_stages = [16, 16*k, 32*k, 64*k]
+
+        # Première couche
+        self.conv1 = conv3x3_lip(n_c, n_stages[0])
+        
+        # Couches Wide ResNet
+        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
+        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
+        self.layer3 = self._wide_layer(n_stages[3], n, stride=2)
+        
+        #self.bn1 = torchlip.BatchCentering(n_stages[3])
+        self.bn1 = Identity()
+        
+        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+
+    def _wide_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        out = self.bn1(out)
+        out = self.activation(out)
+        
+        
+        out = self.lipavgpool2d(out) 
+        
+        out = out.view(out.size(0), -1)
+        
+        logits = self.linear(out)
+        energy = self.linear_energy(logits)
+        return self.Lip_const * energy.squeeze()     
+
+
+
+class TestModel(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
+        super().__init__()
+        self.Lip_const = Lip_const
+
+        self.activation = torchlip.GroupSort2()
+        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        n_stages = [16, 16*k, 32*k, 64*k]
+
+        # Première couche
+        self.conv1 = conv3x3_lip(n_c, n_stages[0])
+        
+        # Couches Wide ResNet
+        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
+        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
+        self.layer3 = self._wide_layer(n_stages[3], n, stride=2)
+        
+        #self.bn1 = torchlip.BatchCentering(n_stages[3])
+        self.bn1 = Identity()
+        
+        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+        self.ebm_head = self._make_head(n_stages[3], n_classes, lip=False)
+
+    def _make_head(self, in_dim, out_dim, lip):
+        hidden_dim = in_dim * 2
+        layers = []
+        if lip:
+            layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())            
+            layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(out_dim, 1))
+            
+        else:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(out_dim, 1))
+            
+        return nn.Sequential(*layers)
+
+    def _wide_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        out = self.bn1(out)
+        out = self.activation(out)
+        
+        
+        out = self.lipavgpool2d(out) 
+        
+        out = out.view(out.size(0), -1)
+        
+        # multiply by Lip_const only on the lip parts of the network, not on the EBM head
+        out = self.Lip_const * out
+
+        energy = self.ebm_head(out)
+        return energy.squeeze()     
+
+
+
+class BigTestModel(nn.Module):
+    def __init__(self, depth=16, widen_factor=3, n_c=3, n_classes=10, Lip_const = 1.0):
+        super().__init__()
+        self.Lip_const = Lip_const
+
+        self.activation = torchlip.GroupSort2()
+        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        n0 = 16
+        self.in_planes = 128
+
+        n_stages = [128, 128, 256, 256]
+
+        # Première couche
+        self.conv1 = conv3x3_lip(n_c, n_stages[0])
+        
+        # Couches Wide ResNet
+        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
+        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
+        self.layer3 = self._wide_layer(n_stages[3], n, stride=2)
+        
+        #self.bn1 = torchlip.BatchCentering(n_stages[3])
+        self.bn1 = Identity()
+        
+        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+        self.ebm_head = self._make_head(n_stages[3], n_classes, lip=False)
+
+    def _make_head(self, in_dim, out_dim, lip):
+        hidden_dim = in_dim * 2
+        layers = []
+        if lip:
+            layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())            
+            layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(out_dim, 1))
+            
+        else:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(out_dim, 1))
+            
+        return nn.Sequential(*layers)
+
+    def _wide_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        out = self.bn1(out)
+        out = self.activation(out)
+        
+        
+        out = self.lipavgpool2d(out) 
+        
+        out = out.view(out.size(0), -1)
+        
+        # multiply by Lip_const only on the lip parts of the network, not on the EBM head
+        out = self.Lip_const * out
+
+        energy = self.ebm_head(out)
+        return energy.squeeze()     
+
+
+class TestInvModel(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, Lip_const=1.0, norm=None, leak=0.2, n_classes=10):
+        super().__init__()
+        self.lrelu    = nn.LeakyReLU(leak)
+        self.in_planes = 16
+        self.Lip_const = Lip_const
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        nStages = [16, 16*k, 32*k, 64*k]
+
+        self.conv1  = conv3x3(n_c, nStages[0])
+        self.layer1 = self._wide_layer(nStages[1], n, stride=1, norm=norm, leak=leak)
+        self.layer2 = self._wide_layer(nStages[2], n, stride=2, norm=norm, leak=leak)
+        self.layer3 = self._wide_layer(nStages[3], n, stride=2, norm=norm, leak=leak)
+        self.bn1    = get_norm(nStages[3], norm)
+        self.ebm_head = self._make_head(nStages[3], n_classes, lip=True)
+
+    def _make_head(self, in_dim, out_dim, lip):
+        hidden_dim = in_dim * 2
+        layers = []
+        if lip:
+            layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())            
+            layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(out_dim, 1))
+            
+        else:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(out_dim, 1))
+            
+        return nn.Sequential(*layers)
+
+    def _wide_layer(self, planes, num_blocks, stride, norm, leak):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers  = []
+        for s in strides:
+            layers.append(wide_basic(self.in_planes, planes, stride=s, norm=norm, leak=leak))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.lrelu(self.bn1(out))
+        out = F.avg_pool2d(out, 8)
+        out = out.view(out.size(0), -1)
+        logits = self.ebm_head(out)
+        return self.Lip_const * logits.squeeze()       
+
+
+class Semihalf(nn.Module):
+    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
+        super().__init__()
+        self.Lip_const = Lip_const
+
+        self.activation = nn.LeakyReLU(0.05)
+        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
+        n_stages = [16, 16*k, 32*k, 64*k]
+
+        # Première couche
+        self.conv1 = conv3x3_lip(n_c, n_stages[0])
+        
+        # Couches Wide ResNet
+        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
+        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
+        self.layer3 = self._wide_layer_nonlip(n_stages[3], n, stride=2)
+        
+        #self.bn1 = torchlip.BatchCentering(n_stages[3])
+        self.bn1 = Identity()
+        
+        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+        self.ebm_head = self._make_head(n_stages[3], n_classes, lip=False)
+
+    def _make_head(self, in_dim, out_dim, lip):
+        hidden_dim = in_dim * 2
+        layers = []
+        if lip:
+            layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
+            layers.append(torchlip.GroupSort2())            
+            layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
+            layers.append(torchlip.GroupSort2())
+            layers.append(torchlip.SpectralLinear(out_dim, 1))
+            
+        else:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            layers.append(nn.LeakyReLU(0.05))
+            layers.append(nn.Linear(out_dim, 1))
+            
+        return nn.Sequential(*layers)
+
+    def _wide_layer_nonlip(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def _wide_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        out = self.bn1(out)
+        out = self.activation(out)
+        
+        
+        out = self.lipavgpool2d(out) 
+        
+        out = out.view(out.size(0), -1)
+        
+        # multiply by Lip_const only on the lip parts of the network, not on the EBM head
+        out = self.Lip_const * out
+
+        energy = self.ebm_head(out)
+        return energy.squeeze()    

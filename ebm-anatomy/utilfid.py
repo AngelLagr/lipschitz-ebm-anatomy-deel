@@ -73,6 +73,25 @@ class InceptionFeatures(torch.nn.Module):
 
         return out
 
+class InceptionLogits(torch.nn.Module): # pour calculer l'is
+    def __init__(self):
+        super().__init__()
+        model = inception_v3(pretrained=True, aux_logits=True)
+        # on NE remplace PAS model.fc : on garde les 1000 logits ImageNet
+        model.eval()
+        self.model = model
+
+    def forward(self, x):
+        x = x.half()
+        x = torch.nn.functional.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1,3,1,1)
+        out = self.model(((x - mean) / std).half())
+
+        if isinstance(out, tuple):
+            out = out[0]
+
+        return out  # (B, 1000) logits, pas des features
 
 @torch.no_grad()
 def get_features(x, model):
@@ -121,23 +140,16 @@ def compute_fid_batch(real_batch, generated_batch, feature_extractor, cifar=Fals
     fid = calculate_fid(real_feat, gen_feat)
     return fid
 
-def compute_is_batch(x_q_fid, x_s_t_longrun, feature_extractor, cifar=False):
+def compute_is_batch(x_s_t_longrun, logits_extractor, cifar=False):
     with t.no_grad():
         if cifar:
-            real_feat = get_features(x_q_fid, feature_extractor)
-            gen_feat = get_features(x_s_t_longrun, feature_extractor)
+            gen_feat = get_features(x_s_t_longrun, logits_extractor)  # get_features doit appeler logits_extractor
         else:
-            real_feat = feature_extractor(x_q_fid).cpu().numpy()
-            gen_feat = feature_extractor(x_s_t_longrun).cpu().numpy()
-    
-    # Compute class probabilities using softmax
+            gen_feat = logits_extractor(x_s_t_longrun).cpu().numpy()
+
     from scipy.special import softmax
-    p_yx = softmax(gen_feat, axis=1)  # P(y|x)
-    p_y = np.mean(p_yx, axis=0)       # P(y)
-    
-    # Compute KL divergence for each sample
-    kl_divs = np.sum(p_yx * (np.log(p_yx + 1e-10) - np.log(p_y + 1e-10)), axis=1)
-    
-    # Inception Score is exp of average KL divergence
+    p_yx = softmax(gen_feat, axis=1)
+    p_y = np.mean(p_yx, axis=0)
+    kl_divs = np.sum(p_yx * (np.log(p_yx + 1e-8) - np.log(p_y + 1e-8)), axis=1)
     inception_score = np.exp(np.mean(kl_divs))
     return inception_score
