@@ -15,7 +15,7 @@ from utilfid import *
 # PARAMETRES (EN HAUT)
 # =========================
 
-EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10_nofft_lr6e-6/'
+EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10_regul_0001/'
 
 # find any json config file in the code directory of the experiment
 CONFIG_FILE = None
@@ -26,11 +26,11 @@ for file in os.listdir(EXP_DIR+'code/'):
 if CONFIG_FILE is None:
     raise FileNotFoundError(f"No JSON config file found in {EXP_DIR}")
 
-CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_017000.pth'
+CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_165000.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 3000
 LONGRUN_STEPS = 800
-LONGRUN_INIT = 'uniform'  # 'uniform', 'gaussian', or 'fft'
+LONGRUN_INIT = 'fft'  # 'uniform', 'gaussian', or 'fft'
 FFT_NOISE_BANDS = ('low', 'mid', 'high')  # pour init_type='fft'
 SEED = 42
 
@@ -169,26 +169,25 @@ def sample_s_t(f, config, device, L, init_type, batch_size, lip_const=None,
 
     results      = []
     grad_results = []
-    # Clé : step (int) → liste de tenseurs CPU (un par chunk)
+    ens_results  = []          
     chunk_snapshots = {}
 
     for i in range(0, batch_size, 1000):
         print(f"\n batch chunk :{i} \n")
         chunk = x_s_t_0[i:i+1000]
-        out, _, grads, snaps = langevin_grad(
+        out, ens, grads, snaps = langevin_grad(     # <-- récupère ens
             f, chunk, config, temp, lip_const,
             fid_eval_interval=fid_eval_interval
         )
         results.append(out.cpu())
         grad_results.append(grads)
+        ens_results.append(ens)                      # <-- AJOUT
 
-        # Accumule les snapshots de ce chunk
         for step, snap in snaps.items():
             chunk_snapshots.setdefault(step, []).append(snap)
 
         t.cuda.empty_cache()
 
-    # Concatène les snapshots de tous les chunks
     agg_snapshots = {
         step: t.cat(tensors, dim=0)
         for step, tensors in chunk_snapshots.items()
@@ -196,6 +195,7 @@ def sample_s_t(f, config, device, L, init_type, batch_size, lip_const=None,
 
     return (t.cat(results, dim=0).to(device),
             t.cat(grad_results, dim=1),
+            t.cat(ens_results, dim=1),                # <-- AJOUT
             agg_snapshots)
 
 
@@ -271,7 +271,7 @@ with t.no_grad():
     x_q_fid = sample_q(q, config['data_epsilon'], FID_BATCH_SIZE)
 
 # -------- compute long-run FID from noise init --------
-x_s_t_longrun, longrun_grads, longrun_snapshots = sample_s_t(
+x_s_t_longrun, longrun_grads, longrun_ens, longrun_snapshots = sample_s_t(
     f=f,
     config=config,
     device=device,
@@ -283,6 +283,22 @@ x_s_t_longrun, longrun_grads, longrun_snapshots = sample_s_t(
 )
 
 longrun_grads = longrun_grads.detach()
+longrun_ens   = longrun_ens.detach()          # <-- AJOUT
+mean_ens = longrun_ens.mean(dim=1).cpu().numpy()   # <-- AJOUT (aligné avec mean_grads)
+
+with t.no_grad():
+    x_q_fid = sample_q(q, config['data_epsilon'], FID_BATCH_SIZE)
+
+# -------- énergie moyenne des données réelles (fixe) --------
+with t.no_grad():
+    real_ens_chunks = []
+    for i in range(0, x_q_fid.shape[0], 1000):
+        chunk = x_q_fid[i:i+1000]
+        en_chunk = f(chunk) / temp
+        real_ens_chunks.append(en_chunk.cpu())
+    real_energy_mean = t.cat(real_ens_chunks, dim=0).mean().item()
+
+print(f"Mean energy (real data) = {real_energy_mean:.6f}")
 
 # -----------------------------------------------------------------------
 # Calcul du FID sur chaque snapshot (dans l'ordre des steps)
@@ -331,6 +347,8 @@ mean_grads = longrun_grads.mean(dim=1).cpu().numpy()
 
 fig, ax1 = plt.subplots(figsize=(12, 5))
 ax2 = ax1.twinx()
+ax3 = ax1.twinx()                              # <-- AJOUT 3e axe
+ax3.spines['right'].set_position(('outward', 60))  # décale le 3e axe
 
 line1, = ax1.plot(steps_axis, mean_grads, color='steelblue', linewidth=1.0,
                   alpha=0.85, label='Mean gradient norm')
@@ -343,7 +361,16 @@ line2, = ax2.plot(fid_steps, fid_values, color='darkorange', linewidth=1.5,
 ax2.set_ylabel('FID', color='darkorange')
 ax2.tick_params(axis='y', labelcolor='darkorange')
 
-lines  = [line1, line2]
+line3, = ax3.plot(steps_axis, mean_ens, color='crimson', linewidth=1.0,
+                  alpha=0.7, label='Mean energy (model samples)')
+ax3.set_ylabel('Mean energy', color='crimson')
+ax3.tick_params(axis='y', labelcolor='crimson')
+
+line4 = ax3.axhline(real_energy_mean, color='crimson', linestyle='--',    # <-- AJOUT
+                     linewidth=1.2, alpha=0.9,
+                     label='Mean energy (real data)')
+
+lines  = [line1, line2, line3, line4]          # <-- inclut line4
 labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc='upper right', framealpha=0.85)
 

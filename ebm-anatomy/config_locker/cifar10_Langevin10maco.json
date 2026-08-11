@@ -13,7 +13,7 @@
   "_comment": "net_type should use one of the following: vanilla, nonlocal",
   "net_type": "wideresnet",
   "_comment": "optimizer_type should use one of the following: sgd, adam",
-  "optimizer_type": "sgd",
+  "optimizer_type": "adam",
   "lr_init": 5e-3,
   "lr_min": 5e-3,
   "lr_decay": 1.0,

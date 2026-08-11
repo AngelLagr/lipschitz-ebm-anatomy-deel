@@ -18,12 +18,12 @@ from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10_nofft_lr3e-6/'
+EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_semihalfLipDu3FFT.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995 # transition smoothness
-FFT_NOISE = False
+FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 HKR_LOSS = False
 REGULARIZE = False

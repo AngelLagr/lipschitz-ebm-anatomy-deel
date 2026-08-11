@@ -20,7 +20,7 @@ from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_maco_lang100_epislon_sgd/'
+EXP_DIR = './out_data/Expe/cifar10_maco_lang100_langevinstepsnoise/'
 # WARNING : ONLY WORK WITH CIFAR10
 CONFIG_FILE = './config_locker/cifar10_Langevin10maco.json'
 RANDOMRATE = 0.95 

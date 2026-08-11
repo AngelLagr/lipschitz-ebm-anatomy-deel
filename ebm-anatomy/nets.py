@@ -757,68 +757,6 @@ class BigTestModel(nn.Module):
         return energy.squeeze()     
 
 
-class TestInvModel(nn.Module):
-    def __init__(self, depth=16, widen_factor=2, n_c=3, Lip_const=1.0, norm=None, leak=0.2, n_classes=10):
-        super().__init__()
-        self.lrelu    = nn.LeakyReLU(leak)
-        self.in_planes = 16
-        self.Lip_const = Lip_const
-
-        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
-        n = (depth - 4) // 6
-        k = widen_factor
-        nStages = [16, 16*k, 32*k, 64*k]
-
-        self.conv1  = conv3x3(n_c, nStages[0])
-        self.layer1 = self._wide_layer(nStages[1], n, stride=1, norm=norm, leak=leak)
-        self.layer2 = self._wide_layer(nStages[2], n, stride=2, norm=norm, leak=leak)
-        self.layer3 = self._wide_layer(nStages[3], n, stride=2, norm=norm, leak=leak)
-        self.bn1    = get_norm(nStages[3], norm)
-        self.ebm_head = self._make_head(nStages[3], n_classes, lip=True)
-
-    def _make_head(self, in_dim, out_dim, lip):
-        hidden_dim = in_dim * 2
-        layers = []
-        if lip:
-            layers.append(torchlip.SpectralLinear(in_dim, hidden_dim))
-            layers.append(torchlip.GroupSort2())
-            layers.append(torchlip.SpectralLinear(hidden_dim, hidden_dim))
-            layers.append(torchlip.GroupSort2())            
-            layers.append(torchlip.SpectralLinear(hidden_dim, out_dim))
-            layers.append(torchlip.GroupSort2())
-            layers.append(torchlip.SpectralLinear(out_dim, 1))
-            
-        else:
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.05))
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.05))
-            layers.append(nn.Linear(hidden_dim, out_dim))
-            layers.append(nn.LeakyReLU(0.05))
-            layers.append(nn.Linear(out_dim, 1))
-            
-        return nn.Sequential(*layers)
-
-    def _wide_layer(self, planes, num_blocks, stride, norm, leak):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers  = []
-        for s in strides:
-            layers.append(wide_basic(self.in_planes, planes, stride=s, norm=norm, leak=leak))
-            self.in_planes = planes
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.lrelu(self.bn1(out))
-        out = F.avg_pool2d(out, 8)
-        out = out.view(out.size(0), -1)
-        logits = self.ebm_head(out)
-        return self.Lip_const * logits.squeeze()       
-
-
 class Semihalf(nn.Module):
     def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
         super().__init__()
