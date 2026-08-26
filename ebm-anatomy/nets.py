@@ -762,7 +762,9 @@ class Semihalf(nn.Module):
         super().__init__()
         self.Lip_const = Lip_const
 
-        self.activation = nn.LeakyReLU(0.05)
+        #self.activation = nn.LeakyReLU(0.05)
+        #swish activation
+        self.activation = nn.SiLU()
         self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
         self.in_planes = 16
 

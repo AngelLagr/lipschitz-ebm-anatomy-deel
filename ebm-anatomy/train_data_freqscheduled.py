@@ -12,7 +12,7 @@ import numpy as np
 import random
 import torch.fft as fft
 from nets import *
-from utils import download_flowers_data, plot_ims, plot_diagnostics
+from ebm_utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 
 # ── experiment paths ────────────────────────────────────────────────────────────

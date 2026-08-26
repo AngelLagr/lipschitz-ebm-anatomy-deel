@@ -15,7 +15,7 @@ import random
 import torch.nn.functional as F
 from deel.torchlip.modules.loss import HKRLoss
 from nets import *
-from utils import download_flowers_data, plot_ims, plot_diagnostics
+from ebm_utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 import torch.fft as fft
 

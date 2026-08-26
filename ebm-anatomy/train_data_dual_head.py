@@ -22,7 +22,7 @@ from deel import torchlip
 from deel.torchlip.modules.loss import HKRLoss
 
 from utilfid import *
-from utils import download_flowers_data, plot_diagnostics, plot_ims
+from ebm_utils import download_flowers_data, plot_diagnostics, plot_ims
 
 
 # -----------------------------------------------------------------------------

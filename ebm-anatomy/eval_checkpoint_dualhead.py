@@ -7,7 +7,7 @@ import argparse
 import matplotlib.pyplot as plt
 import torch.fft as fft
 
-from utils import*
+from ebm_utils import*
 from nets import *
 from utilfid import *
 

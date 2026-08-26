@@ -7,7 +7,7 @@ import argparse
 import matplotlib.pyplot as plt
 import torch.fft as fft
 
-from utils import*
+from ebm_utils import*
 from nets import *
 from utilfid import *
 
@@ -15,7 +15,7 @@ from utilfid import *
 # PARAMETRES (EN HAUT)
 # =========================
 
-EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10_regul_0001/'
+EXP_DIR = './out_data/Expe/cifar10_lang20_dim8x8up16x16up32x32/'
 
 # find any json config file in the code directory of the experiment
 CONFIG_FILE = None
@@ -26,17 +26,19 @@ for file in os.listdir(EXP_DIR+'code/'):
 if CONFIG_FILE is None:
     raise FileNotFoundError(f"No JSON config file found in {EXP_DIR}")
 
-CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_165000.pth'
+CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_025000.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 3000
 LONGRUN_STEPS = 800
-LONGRUN_INIT = 'fft'  # 'uniform', 'gaussian', or 'fft'
+LONGRUN_INIT = 'uniform'  # 'uniform', 'gaussian', or 'fft'
 FFT_NOISE_BANDS = ('low', 'mid', 'high')  # pour init_type='fft'
 SEED = 42
 
 # Calcule le FID toutes les FID_EVAL_INTERVAL itérations Langevin.
 # Mettre à None pour désactiver (comportement original).
 FID_EVAL_INTERVAL = 50   # ex: 50, 100, 200 …
+DIM_RESIZE = True # si True, on ramène d'abord l'image à ORIG_SZ, puis on l'agrandit (ORIG_SZ devient la résolution des détails de l'image)
+ORIG_SZ = 8  # résolution de détail de l'image
 
 # -------- load config/device --------
 with open(CONFIG_FILE) as file:
@@ -203,7 +205,7 @@ def sample_s_t(f, config, device, L, init_type, batch_size, lip_const=None,
 print('Setting up network and optimizer...')
 # set up network
 # set up network
-net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel,'testinv': TestInvModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
+net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
 if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium","test","testinv", "semihalf","bigtest"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
     print(f"Initialized {config['net_type']} with Lip_const={config['Lip_const']}")
@@ -248,12 +250,29 @@ data = {
     'mnist': lambda path, func: datasets.MNIST(root=path, transform=func, download=True),
     'flowers': lambda path, func: datasets.ImageFolder(root=path, transform=func),
 }
-transform = tr.Compose([
-    tr.Resize(config['im_sz']),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    tr.Normalize(tuple(0.5 * t.ones(config['im_ch'])), tuple(0.5 * t.ones(config['im_ch']))),
-])
+
+# ---- construction du pipeline de transform ----
+if DIM_RESIZE:
+    # 1) on ramène d'abord l'image à sa résolution de détail d'origine
+    #    (ORIG_SZ, ex: 8x8), avec l'interpolation par défaut.
+    # 2) on l'agrandit ensuite vers la résolution finale (config['im_sz'],
+    #    ex: 32x32) en mode NEAREST : chaque pixel d'origine est dupliqué
+    #    en bloc (facteur = im_sz / ORIG_SZ, ex: 32/8 = 4 -> blocs 4x4).
+    resize_steps = [
+        tr.Resize(ORIG_SZ),
+        tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
+    ]
+    print('DIM_RESIZE actif : {} -> {} (blocs {}x{}, interpolation nearest)'.format(
+        ORIG_SZ, config['im_sz'],
+        config['im_sz'] // ORIG_SZ, config['im_sz'] // ORIG_SZ))
+else:
+    resize_steps = [tr.Resize(config['im_sz'])]
+
+transform = tr.Compose(resize_steps + [
+                        tr.CenterCrop(config['im_sz']),
+                        tr.ToTensor(),
+                        tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
+
 q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform)]).to(device)
 
 # -------- compute FID batch=10000 --------

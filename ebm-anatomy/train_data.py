@@ -13,26 +13,29 @@ import random
 import torch.nn.functional as F
 from deel.torchlip.modules.loss import HKRLoss
 from nets import *
-from utils import download_flowers_data, plot_ims, plot_diagnostics
+from ebm_utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 import torch.fft as fft
 
 # directory for experiment results
-EXP_DIR = './out_data/Expe/cifar10_semihalf10Lip_lang10/'
-CONFIG_FILE = './config_locker/cifar10_Langevin10_semihalfLipDu3FFT.json'
+#swish and spectralnorm
+EXP_DIR = './out_data/Expe/cifar10_lang20_dim8x8upsample32x32_bis/'
+CONFIG_FILE = './config_locker/cifar10_Langevin10.json'
 RANDOMRATE = 0.95
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
 ALPHA = 0.995 # transition smoothness
-FFT_NOISE = True
+FFT_NOISE = False
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 HKR_LOSS = False
-REGULARIZE = False
-REGUL_WEIGHT = 5e-3
+REGULARIZE = True
+REGUL_WEIGHT = 1e-4
 HKR_ALPHA = 0.999
 LANGEVIN_SQUARED_NORMALISED = False
 
 DST_SCALED = False
 
+DIM_RESIZE = True
+ORIG_SZ = 8  # résolution de détail de l'image
 #######################
 # ## INITIAL SETUP ## #
 #######################
@@ -66,7 +69,7 @@ def save_code():
         file_out = open(EXP_DIR + 'code/' + os.path.basename(file_name), 'w')
         for line in file_in:
             file_out.write(line)
-    for file in ['train_data.py', 'nets.py', 'utils.py', CONFIG_FILE]:
+    for file in ['train_data.py', 'nets.py', 'ebm_utils.py', CONFIG_FILE]:
         save_file(file)
 save_code()
 
@@ -98,7 +101,7 @@ else:
 
 print('Setting up network and optimizer...')
 # set up network
-net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel,'testinv': TestInvModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
+net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
 if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium","test","testinv", "semihalf","bigtest"):
     f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
     print(f"Initialized {config['net_type']} with Lip_const={config['Lip_const']}")
@@ -165,10 +168,30 @@ if config['data'] == 'flowers':
 data = {'cifar10': lambda path, func: datasets.CIFAR10(root=path, transform=func, download=True),
         'mnist': lambda path, func: datasets.MNIST(root=path, transform=func, download=True),
         'flowers': lambda path, func: datasets.ImageFolder(root=path, transform=func)}
-transform = tr.Compose([tr.Resize(config['im_sz']),
+
+
+# ---- construction du pipeline de transform ----
+if DIM_RESIZE:
+    # 1) on ramène d'abord l'image à sa résolution de détail d'origine
+    #    (ORIG_SZ, ex: 8x8), avec l'interpolation par défaut.
+    # 2) on l'agrandit ensuite vers la résolution finale (config['im_sz'],
+    #    ex: 32x32) en mode NEAREST : chaque pixel d'origine est dupliqué
+    #    en bloc (facteur = im_sz / ORIG_SZ, ex: 32/8 = 4 -> blocs 4x4).
+    resize_steps = [
+        tr.Resize(ORIG_SZ),
+        tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
+    ]
+    print('DIM_RESIZE actif : {} -> {} (blocs {}x{}, interpolation nearest)'.format(
+        ORIG_SZ, config['im_sz'],
+        config['im_sz'] // ORIG_SZ, config['im_sz'] // ORIG_SZ))
+else:
+    resize_steps = [tr.Resize(config['im_sz'])]
+
+transform = tr.Compose(resize_steps + [
                         tr.CenterCrop(config['im_sz']),
                         tr.ToTensor(),
                         tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
+
 q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform)]).to(device)
 
 #print size of dataset 
