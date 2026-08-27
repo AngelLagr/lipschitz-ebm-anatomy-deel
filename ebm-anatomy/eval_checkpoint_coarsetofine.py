@@ -3,10 +3,11 @@
 #####################################################################
 #
 # Ce script évalue le modèle produit par train_coarsetofine.py.
-# Il charge f / f16 / f32 depuis le checkpoint complet, génère des
-# images en cascade (chaque étage part du résultat Langevin de
-# l'étage précédent, PAS d'un nouveau bruit), et pour chaque
-# résolution (8x8, 16x16, 32x32) :
+# Il charge f / f16 / f32 depuis un checkpoint (soit le dernier
+# checkpoint complet, soit un checkpoint à une itération précise),
+# génère des images en cascade (chaque étage part du résultat
+# Langevin de l'étage précédent, PAS d'un nouveau bruit), et pour
+# chaque résolution (8x8, 16x16, 32x32) :
 #   - calcule le FID face à la vraie distribution de cette résolution
 #   - sauvegarde une grille d'images
 #   - (optionnel) trace FID / gradient en fonction du pas Langevin
@@ -29,10 +30,23 @@ from ebm_utils import *
 from nets import *
 from utilfid import *
 
-EXP_DIR = './out_data/Expe/cifar10_lang20_dim8x8up16x16up32x32/'
+EXP_DIR = './out_data/Expe/cifar10_lang30_dim8x8up16x16up32x32/'
 
-# checkpoint complet (contient f, f16 et f32 en même temps)
-CHECKPOINT_FILE = EXP_DIR + 'checkpoints/last_checkpoint.pth'
+# =========================
+# SELECTION DU CHECKPOINT
+# =========================
+# Laisser à None pour charger le dernier checkpoint complet
+# (checkpoints/last_checkpoint.pth), qui contient f, f16 et f32
+# ensemble ainsi que le lip_const enregistré.
+#
+# Mettre un numéro d'itération précis (ex: 5000) pour charger les
+# poids sauvegardés à cette itération, via les fichiers
+# net_XXXXXX.pth / net16_XXXXXX.pth / net32_XXXXXX.pth (ce sont ceux
+# écrits par train_data.py à chaque `log_freq` itérations).
+CHECKPOINT_ITER = 37000   # ex: 5000
+
+CKPT_DIR = EXP_DIR + 'checkpoints/'
+CHECKPOINT_FILE = CKPT_DIR + 'last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 
 # trouve le json de config sauvegardé pendant l'entraînement
@@ -49,17 +63,17 @@ ORIG_SZ = 8    # résolution de détail "coarse" (stage f)
 MID_SZ = 16    # résolution de détail "mid"    (stage f16)
 # la résolution finale (stage f32) est config['im_sz']
 
-FID_BATCH_SIZE = 1000
+FID_BATCH_SIZE = 3000
 
 # nombre de pas Langevin par étage (peuvent être différents de l'entraînement,
 # on veut typiquement un "long-run" plus long pour bien évaluer chaque stage)
-L_STEPS_STAGE1 = 50    # bruit          -> 8x8 (f)
-L_STEPS_STAGE2 = 300    # sortie stage 1 -> 16x16 (f16)
-L_STEPS_STAGE3 = 300    # sortie stage 2 -> 32x32 (f32)
+L_STEPS_STAGE1 = 300    # bruit          -> 8x8 (f)
+L_STEPS_STAGE2 = 10    # sortie stage 1 -> 16x16 (f16)
+L_STEPS_STAGE3 = 3    # sortie stage 2 -> 32x32 (f32)
 
 # init du tout premier stage (bruit pur)
 STAGE1_INIT = 'uniform'  # 'uniform', 'gaussian', ou 'fft'
-FFT_NOISE_BANDS = ('low', 'mid', 'high')  # pour STAGE1_INIT='fft'
+FFT_NOISE_BANDS = ('low', 'mid', 'high') 
 
 # calcule le FID intermédiaire tous les N pas à l'intérieur de chaque étage
 # (None pour désactiver et ne calculer que le FID final de chaque étage)
@@ -68,7 +82,10 @@ FID_EVAL_INTERVAL = 50
 N_IMAGES_PLOT = 16  # nombre d'images dans les grilles sauvegardées
 SEED = 42
 
-OUT_DIR = EXP_DIR + 'eval_cascade/'
+# le dossier de sortie inclut l'itération choisie pour ne pas écraser
+# les résultats d'une éval à l'autre
+_ckpt_tag = f'iter_0{CHECKPOINT_ITER:06d}' if CHECKPOINT_ITER is not None else 'last'
+OUT_DIR = EXP_DIR + f'eval_cascade/{_ckpt_tag}/'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -115,24 +132,65 @@ def build_net():
     return net
 
 
+def list_available_checkpoints():
+    """Liste les numéros d'itération disponibles, déduits des fichiers
+    net_XXXXXX.pth présents dans le dossier checkpoints/."""
+    iters = []
+    if not os.path.isdir(CKPT_DIR):
+        return iters
+    for fname in os.listdir(CKPT_DIR):
+        if fname.startswith('net_') and fname.endswith('.pth'):
+            middle = fname[len('net_'):-len('.pth')]
+            if middle.isdigit():
+                iters.append(int(middle))
+    return sorted(iters)
+
+
 print('Building networks f, f16, f32...')
 f = build_net()
 f16 = build_net()
 f32 = build_net()
 
-# -------- charge le checkpoint complet --------
-print(f'Loading checkpoint: {CHECKPOINT_FILE}')
-checkpoint = t.load(CHECKPOINT_FILE, map_location=device)
+lip_const = None
 
-if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-    f.load_state_dict(checkpoint['model_state_dict'])
-    f16.load_state_dict(checkpoint['model16_state_dict'])
-    f32.load_state_dict(checkpoint['model32_state_dict'])
-    lip_const = float(checkpoint['lip_const_record'][-1]) if WConstrained_enabled else None
-    print(f"Checkpoint chargé (iter={checkpoint.get('iter', '?')}).")
+if CHECKPOINT_ITER is None:
+    # -------- charge le dernier checkpoint complet --------
+    print(f'Loading latest full checkpoint: {CHECKPOINT_FILE}')
+    checkpoint = t.load(CHECKPOINT_FILE, map_location=device)
+
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        f.load_state_dict(checkpoint['model_state_dict'])
+        f16.load_state_dict(checkpoint['model16_state_dict'])
+        f32.load_state_dict(checkpoint['model32_state_dict'])
+        if WConstrained_enabled:
+            lip_const = float(checkpoint['lip_const_record'][-1])
+        print(f"Checkpoint chargé (iter={checkpoint.get('iter', '?')}).")
+    else:
+        raise RuntimeError('Ce script attend un checkpoint COMPLET (last_checkpoint.pth) '
+                            'contenant model_state_dict / model16_state_dict / model32_state_dict.')
 else:
-    raise RuntimeError('Ce script attend un checkpoint COMPLET (last_checkpoint.pth) '
-                        'contenant model_state_dict / model16_state_dict / model32_state_dict.')
+    # -------- charge les poids sauvegardés à une itération précise --------
+    available = list_available_checkpoints()
+    if CHECKPOINT_ITER not in available:
+        raise FileNotFoundError(
+            f"Aucun checkpoint trouvé pour l'itération {CHECKPOINT_ITER} dans {CKPT_DIR}.\n"
+            f"Itérations disponibles : {available}"
+        )
+
+    net_file = CKPT_DIR + 'net_{:>06d}.pth'.format(CHECKPOINT_ITER)
+    net16_file = CKPT_DIR + 'net16_{:>06d}.pth'.format(CHECKPOINT_ITER)
+    net32_file = CKPT_DIR + 'net32_{:>06d}.pth'.format(CHECKPOINT_ITER)
+
+    print(f'Loading checkpoint at iter {CHECKPOINT_ITER} :')
+    print(f'  {net_file}')
+    print(f'  {net16_file}')
+    print(f'  {net32_file}')
+
+    f.load_state_dict(t.load(net_file, map_location=device))
+    f16.load_state_dict(t.load(net16_file, map_location=device))
+    f32.load_state_dict(t.load(net32_file, map_location=device))
+    # lip_const n'est pas sauvegardé séparément dans ces checkpoints partiels
+    print(f"Checkpoints chargés (iter={CHECKPOINT_ITER}).")
 
 for net in (f, f16, f32):
     net.eval()

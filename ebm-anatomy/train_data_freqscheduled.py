@@ -1,6 +1,6 @@
-#######################################
-# ## TRAIN EBM USING IMAGE DATASET ## #
-#######################################
+##########################################################
+# ## TRAIN EBM WITH FREQUENCY SHEDULING IN THE BUFFER ## #
+##########################################################
 
 import torch as t
 import torchvision.transforms as tr

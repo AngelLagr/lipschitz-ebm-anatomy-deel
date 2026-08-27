@@ -427,7 +427,8 @@ class wide_basic_lip(nn.Module):
         return out
 
 class Wide_ResNet_LLip(nn.Module):
-    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
+    
+    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0, halflip=False):
         super().__init__()
         self.Lip_const = Lip_const
 
@@ -451,8 +452,14 @@ class Wide_ResNet_LLip(nn.Module):
         #self.bn1 = torchlip.BatchCentering(n_stages[3])
         self.bn1 = Identity()
         
-        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
-        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+        if halflip:
+            self.linear = nn.Linear(n_stages[3], n_classes)
+            self.linear_energy = nn.Linear(n_classes, 1)
+           
+        else: 
+            self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
+            self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
+            
 
     def _wide_layer(self, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -476,6 +483,7 @@ class Wide_ResNet_LLip(nn.Module):
         
         out = out.view(out.size(0), -1)
         
+    
         logits = self.linear(out)
         energy = self.linear_energy(logits)
         return self.Lip_const * energy.squeeze()     
@@ -533,62 +541,6 @@ class Wide_ResNet_LLip_Logsumexp(nn.Module):
         
         logits = self.linear(out)
         return self.Lip_const * logits.logsumexp(1) 
-
-
-
-class Wide_ResNet_LLip(nn.Module):
-    def __init__(self, depth=16, widen_factor=2, n_c=3, n_classes=10, Lip_const = 1.0):
-        super().__init__()
-        self.Lip_const = Lip_const
-
-        self.activation = torchlip.GroupSort2()
-        self.lipavgpool2d = torchlip.ScaledAvgPool2d(kernel_size=8)
-        self.in_planes = 16
-
-        assert (depth - 4) % 6 == 0, 'depth must be 6n+4'
-        n = (depth - 4) // 6
-        k = widen_factor
-        n_stages = [16, 16*k, 32*k, 64*k]
-
-        # Première couche
-        self.conv1 = conv3x3_lip(n_c, n_stages[0])
-        
-        # Couches Wide ResNet
-        self.layer1 = self._wide_layer(n_stages[1], n, stride=1)
-        self.layer2 = self._wide_layer(n_stages[2], n, stride=2)
-        self.layer3 = self._wide_layer(n_stages[3], n, stride=2)
-        
-        #self.bn1 = torchlip.BatchCentering(n_stages[3])
-        self.bn1 = Identity()
-        
-        self.linear = torchlip.SpectralLinear(n_stages[3], n_classes)
-        self.linear_energy = torchlip.SpectralLinear(n_classes, 1)
-
-    def _wide_layer(self, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for s in strides:
-            layers.append(wide_basic_lip(self.in_planes, planes, stride=s))
-            self.in_planes = planes
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-
-        out = self.bn1(out)
-        out = self.activation(out)
-        
-        
-        out = self.lipavgpool2d(out) 
-        
-        out = out.view(out.size(0), -1)
-        
-        logits = self.linear(out)
-        energy = self.linear_energy(logits)
-        return self.Lip_const * energy.squeeze()     
 
 
 

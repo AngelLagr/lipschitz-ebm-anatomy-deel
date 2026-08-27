@@ -17,25 +17,40 @@ from ebm_utils import download_flowers_data, plot_ims, plot_diagnostics
 from utilfid import *
 import torch.fft as fft
 
-# directory for experiment results
-#swish and spectralnorm
+# ── experiment paths ────────────────────────────────────────────────────────────
 EXP_DIR = './out_data/Expe/cifar10_lang20_dim8x8upsample32x32_bis/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10.json'
+
+# ── sampling hyper-parameters ───────────────────────────────────────────────────
 RANDOMRATE = 0.95
+LANGEVIN_SQUARED_NORMALISED = False
+
+# ─ Lipschitz parameters ─────────────────────────────────────────────────────────
 K_FACTOR = 2.0 # factor to scale the Lipschitz constant for the K constraint
-ALPHA = 0.995 # transition smoothness
+# To activate the automatic update of the Lipschitz constraint (which does not scale during our tests)
+# you need to add in the config file : Wasserstein_LipConstrained = True
+
+# If you want to activate the manual Lip scheduling add in the config file: 
+# - increase_lip_const = True
+# - Lip_const_step = a float
+# - Lip_const_max = a float
+ALPHA = 0.995 # transition smoothness of the updating
+
+# ─ use FFT-filtered noise or not ────────────────────────────────────────────────
 FFT_NOISE = False
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 HKR_LOSS = False
+
+# ─ Loss parameters ──────────────────────────────────────────────────────────────
 REGULARIZE = True
 REGUL_WEIGHT = 1e-4
 HKR_ALPHA = 0.999
-LANGEVIN_SQUARED_NORMALISED = False
+DST_SCALED = False # changes nothing, it was like that on the original code from Nijkamp
 
-DST_SCALED = False
+# ─ Choose the resolution of the details in the images ───────────────────────────
+DIM_RESIZE = True # Activate or not
+ORIG_SZ = 8  # details resolution, the final resolution still will be the im_sz in the config file
 
-DIM_RESIZE = True
-ORIG_SZ = 8  # résolution de détail de l'image
 #######################
 # ## INITIAL SETUP ## #
 #######################
@@ -117,11 +132,8 @@ else :
 hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 current_lip_const=None
 
+# Choose to update the lipschitz constrained every step or not
 WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
-WLang_ratio = float(config.get('WLang_ratio', 0.1))
-lower_bound_const = float(config.get('lower_bound_const', 1))
-upper_bound_const = float(config.get('upper_bound_const', 100))
-
 lip_schedule_enabled = config.get('increase_lip_const', False)
 lip_const_start = float(config.get('Lip_const', 10.0))
 lip_const_step = float(config.get('Lip_const_step', 0.5))
@@ -136,8 +148,6 @@ def update_lip_const(iteration_idx, loss=None, grad=None):
         new_lip_const = min(lip_const_max, lip_const_start + lip_const_step * iteration_idx)
 
     if WConstrained_enabled and not (grad==None) and not (loss==None):        
-        #new_lip_const = np.clip(lip_const, (lower_bound_const * WLang_ratio/grad).cpu(), (upper_bound_const * WLang_ratio/grad).cpu())
-
         buffersize = 60000 if config['data'] == 'mnist' else 50000
         langevin_steps_remaining_in_buffer = config['num_shortrun_steps']/(1-RANDOMRATE) - (config['num_shortrun_steps']/(1-RANDOMRATE)) * (1-(1-(config['batch_size']*(1-RANDOMRATE)/buffersize))**iteration_idx)
         print(f"Estimated Langevin steps remaining in buffer: {langevin_steps_remaining_in_buffer:.2f}")

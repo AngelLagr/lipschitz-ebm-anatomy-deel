@@ -1,6 +1,18 @@
-#######################################
-# ## TRAIN EBM USING IMAGE DATASET ## #
-#######################################
+#########################################################
+# ## TRAIN EBM WITH 2 HEAD : HKR and non-constrained ## #
+#########################################################
+
+# We seek to train a model that uses the expressivity of a non
+# constrained model and the stability of a Lipschitz model
+
+# We use the HKR (Serrurier et al.) to determine if a sample is 
+# close or not to the distribution, just like a classifier. If it's far (over hkr_energy > 0.5 for exemple)
+# from the distribution then we will use the lipschitz head to calculate the energy (like that
+# the langevin will be more stable in this distant region (like noise)). If it's close then
+# we use the non-constrained head (ebm head) to uses the "spiked" and more expressive landscape.
+
+# This "spiked landscape" isn't able to keep the langevin stable if we use it on noise or on distant region from
+# the distribution.
 
 import csv
 import json
@@ -25,30 +37,36 @@ from utilfid import *
 from ebm_utils import download_flowers_data, plot_diagnostics, plot_ims
 
 
-# -----------------------------------------------------------------------------
+# ── experiment paths ─────────────────────────────────────────────
 EXP_DIR = './out_data/Expe/cifar10_Langevin10_only_negative_forebm_regul_0001/'
 CONFIG_FILE = './config_locker/cifar10_Langevin10_LipDu3FFT.json'
 RANDOMRATE = 0.95
 
+# ── sampling hyper-parameters ────────────────────────────────────
 WARMSTEPINIT = False
 LOUIS_STEPSREINIT = False
 NUMBER_OF_LOUIS_STEPS = 1
 
+# ─ Loss parameters ───────────────────────────────────────────────
 LOSS_NORM = True
 REGUL_WEIGHT = 1e-4 # Regularization weight for EBM loss
 ONLY_NEGATIVE_FOR_EBM_LOSS = False
+HKR_ALPHA = 0.999 # Hkr loss alpha param
 
+# ─ Make the nonlip head bigger ───────────────────────────────────
 BIG_HEAD_NONLIP = False
 
-# FFT noise settings
+# ─ use FFT-filtered noise or not ─────────────────────────────────
 FFT_NOISE = True
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
-# Sigmoid param
+# ─ Sigmoid param ─────────────────────────────────────────────────
+# Choose when the non constrained head start to be more important than the lipschitz head
 HKR_THRESHOLD = 0.5
+# parameter that make the transition between the 2 head smooth or not
 TAU = 0.2
 
-HKR_ALPHA = 0.999 # Hkr loss alpha param
+# ─ Other ──────────────────────────────────────────────────────────
 GRAD_PLOT = False # Plots param gradient norms for each component of the model (feature extractor, hkr head, ebm head)
 # -----------------------------------------------------------------------------
 
@@ -241,8 +259,15 @@ class DualHeadLipEBM(nn.Module):
         if head in ('nonlip', 'ebm'):
             return ebm_energy
         if head == 'theta':
+            # theta is the whole model, so we uses as intended both head:
+
+            # the hkr classify if the sample is far or not from the distribution
             alpha = t.sigmoid((hkr_energy - self.hkr_switch_threshold) / self.hkr_tau)
             alpha = alpha.detach()
+
+            # then we interpolate both energy with respect of how much we are far from the distribution :
+            # - close : more ebm_energy
+            # - far : more hkr_energy
             Etheta = alpha * hkr_energy + (1.0 - alpha) * ebm_energy
             return Etheta
         raise RuntimeError('Invalid head (use "theta", "hkr" or "ebm")')
