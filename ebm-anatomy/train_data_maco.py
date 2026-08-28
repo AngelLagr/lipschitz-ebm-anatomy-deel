@@ -2,7 +2,7 @@
 # ## TRAIN EBM USING IMAGE DATASET ## #
 # ##      VERSION MACO (phase)      ## #
 #######################################
-#
+# This version isn't working for now and requieres more investigation
 
 import torch as t
 import torchvision.transforms as tr
