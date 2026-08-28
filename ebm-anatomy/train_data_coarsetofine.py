@@ -18,8 +18,8 @@ from utilfid import *
 import torch.fft as fft
 
 # ── experiment paths ────────────────────────────────────────────────────────────
-EXP_DIR = './out_data/Expe/cifar10_lang10_dim8x8up16x16up32x32_Halflip/'
-CONFIG_FILE = './config_locker/cifar10_Langevin30.json'
+EXP_DIR = './out_data/Expe/cifar10_lang10_dim4x8x16x32/'
+CONFIG_FILE = './config_locker/cifar10_Langevin10coarse.json'
 
 # ── sampling hyper-parameters ───────────────────────────────────────────────────
 RANDOMRATE = 0.95
@@ -43,18 +43,29 @@ FFT_NOISE_BANDS = ('low', 'mid', 'high')
 # ─ Loss parameters ──────────────────────────────────────────────────────────────
 HKR_LOSS = False
 REGULARIZE = True
-REGUL_WEIGHT = 5e-4
+REGUL_WEIGHT = 1e-2
 HKR_ALPHA = 0.999
-DST_SCALED = False # changes nothing, it was like that on the original code from Nijkamp
+DST_SCALED = False # doesn't change anything, it was True on the original code from Nijkamp.
 
-# ─ Choose the resolution of the details in the images ───────────────────────────
+# ─ MULTI-RESOLUTION CASCADE ─────────────────────────────────────────────────────
+# DIM_RESIZE=True   -> multi-résolution cascade. We just give the list of resolutions to traverse 
+#                      (increasing, the last value MUST be equal to config['im_sz']) and the number
+#                      of Langevin steps for each level BEYOND the first (the first level always uses
+#                      config['num_shortrun_steps'], like the original "noise -> data" model).
+# Examples :
+#   4 steps : noise -> 2 -> 4 -> 8 -> 16 -> 32
+#       CASCADE_RESOLUTIONS = [2, 4, 8, 16, 32]
+#       LEVEL_LRS = [9e-4, 6e-4, 4e-4, 3e-4, 2e-4]
+#       CASCADE_STEPS       = [10, 10, 10, 5]  # 2->4, 4->8, 8->16, 16->32 # the number of steps for the first level (noise -> 2) is always config['num_shortrun_steps'] and is not included in CASCADE_STEPS.
+#
+# len(CASCADE_STEPS) = len(CASCADE_RESOLUTIONS) - 1.
 DIM_RESIZE = True
-ORIG_SZ = 8  # details resolution, the final resolution still will be the im_sz in the config file
-
-# ──Intermediate resolution─────────────────────────
-MID_SZ = 16  # mid details resolution (8x8 -> 16x16 -> 32x32)
-MEDIUM_SHORTRUN_STEPS = 10 # number of langevin steps for the intermediate resolution (8x8 -> 16x16)
-LAST_SHORTRUN_STEPS = 5 # number of langevin steps for the last resolution (16x16 -> 32x32)
+CASCADE_RESOLUTIONS = [2, 4, 8, 16, 32]
+# we obtained during our test that the lower the details resolutions are, the more steps are needed to learn the details.
+CASCADE_STEPS = [20, 15, 10, 10]
+# it appear that if the lr is too low in early levels, the model will not learn anything and will diverge
+LEVEL_LRS = [9e-4, 6e-4, 4e-4, 3e-4, 2e-4]
+# With 5 WideResnet (700k param each) we achieve 3.5million parameters
 
 #######################
 # ## INITIAL SETUP ## #
@@ -63,6 +74,24 @@ LAST_SHORTRUN_STEPS = 5 # number of langevin steps for the last resolution (16x1
 # load experiment config
 with open(CONFIG_FILE) as file:
     config = json.load(file)
+
+if not DIM_RESIZE:
+    # mode "un seul niveau" : pas de cascade, on entraîne directement à la résolution finale
+    CASCADE_RESOLUTIONS = [config['im_sz']]
+    CASCADE_STEPS = []
+
+# validation de la config de la cascade
+assert CASCADE_RESOLUTIONS[-1] == config['im_sz'], \
+    'La dernière résolution de CASCADE_RESOLUTIONS doit être égale à config["im_sz"] ({}).'.format(config['im_sz'])
+assert len(CASCADE_STEPS) == len(CASCADE_RESOLUTIONS) - 1, \
+    'CASCADE_STEPS doit contenir exactement len(CASCADE_RESOLUTIONS)-1 valeurs (une par transition).'
+for a, b in zip(CASCADE_RESOLUTIONS[:-1], CASCADE_RESOLUTIONS[1:]):
+    assert a < b, 'CASCADE_RESOLUTIONS doit être strictement croissante ({} >= {}).'.format(a, b)
+N_LEVELS = len(CASCADE_RESOLUTIONS)
+
+assert len(LEVEL_LRS) == N_LEVELS, \
+    'LEVEL_LRS must contain exactly N_LEVELS ({}) values, one per cascade level.'.format(N_LEVELS)
+
 
 # make directory for saving results
 if os.path.exists(EXP_DIR):
@@ -89,7 +118,7 @@ def save_code():
         file_out = open(EXP_DIR + 'code/' + os.path.basename(file_name), 'w')
         for line in file_in:
             file_out.write(line)
-    for file in ['train_data.py', 'nets.py', 'ebm_utils.py', CONFIG_FILE]:
+    for file in ['train_data_coarsetofine.py', 'nets.py', 'ebm_utils.py', CONFIG_FILE]:
         save_file(file)
 save_code()
 
@@ -122,17 +151,41 @@ else:
 print('Setting up network and optimizer...')
 # set up network
 net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test' : TestModel, 'vanilla': VanillaNet,'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet,'vanillaHalfLip': VanillaNetHalfLip,'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet':Wide_ResNet, "wideresnetLip" : Wide_ResNet_LLip, "wideresnetLip_Logsumexp": Wide_ResNet_LLip_Logsumexp, "orthogonium": VanillaNetOrthogonium}
-if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium","test","testinv", "semihalf","bigtest"):
-    f = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
-    print(f"Initialized {config['net_type']} with Lip_const={config['Lip_const']}")
-elif (config['net_type']=="wideresnet22"):
-    f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 22).to(device)
-elif (config['net_type']=="wideresnet34"):
-    f = net_bank["wideresnet"](n_c=config['im_ch'],depth = 34).to(device)
-elif (config['net_type']=="wideresnetLip22"):
-    f = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'],depth = 22).to(device)
-else :
-    f = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
+
+def build_net():
+    """Construit un réseau selon config['net_type'], avec la même logique de sélection
+    que le modèle de base (factorisée pour pouvoir instancier autant de niveaux que voulu)."""
+    if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium", "test", "testinv", "semihalf", "bigtest"):
+        net = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
+    elif (config['net_type'] == "wideresnet22"):
+        net = net_bank["wideresnet"](n_c=config['im_ch'], depth=22).to(device)
+    elif (config['net_type'] == "wideresnet34"):
+        net = net_bank["wideresnet"](n_c=config['im_ch'], depth=34).to(device)
+    elif (config['net_type'] == "wideresnetLip22"):
+        net = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'], depth=22).to(device)
+    elif (config['net_type'] == "wideresnetsmaller"):
+        net = net_bank["wideresnet"](n_c=config['im_ch'], depth=10, widen_factor=2).to(device)
+    else:
+        net = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
+    return net
+
+# ── un réseau + un optimiseur par niveau de la cascade ─────────────────────────
+nets = [build_net() for _ in range(N_LEVELS)]
+
+optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
+if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0 and DST_SCALED:
+    # scale learning rate according to langevin noise for invariant tuning
+    config['lr_init'] *= (config['epsilon'] ** 2) / 2
+    config['lr_min'] *= (config['epsilon'] ** 2) / 2
+
+# let the user choose the first learning rate of the first model with FIRST_EBM_LR, all the other hyperparameters are set in the config file
+
+optims = [optim_bank[config['optimizer_type']](net.parameters(), lr=LEVEL_LRS[idx])
+          for idx, net in enumerate(nets)]
+# alias pour conserver la compatibilité avec tout le code "niveau 0" ci-dessous
+# (HKR loss, scheduling du Lip const, échantillonnage longrun, FID, ...)
+f = nets[0]
+optim = optims[0]
 
 hkr_loss_fn = HKRLoss(alpha=HKR_ALPHA, min_margin=1.0)
 current_lip_const=None
@@ -167,42 +220,6 @@ def update_lip_const(iteration_idx, loss=None, grad=None):
     f.Lip_const = new_lip_const
     return new_lip_const
 
-# set up optimizer
-optim_bank = {'adam': t.optim.Adam, 'sgd': t.optim.SGD, 'adamW': t.optim.AdamW}
-if config['optimizer_type'] == 'sgd' and config['epsilon'] > 0 and DST_SCALED:
-    # scale learning rate according to langevin noise for invariant tuning
-    config['lr_init'] *= (config['epsilon'] ** 2) / 2
-    config['lr_min'] *= (config['epsilon'] ** 2) / 2
-optim = optim_bank[config['optimizer_type']](f.parameters(), lr=config['lr_init'])
-
-
-# ============================================================ #
-# ## NOUVEAU : 2 EBM supplémentaires pour la cascade 8->16->32 ##
-# ============================================================ #
-# On factorise la logique de création de réseau (identique à celle de f
-# ci-dessus) dans une fonction, sans toucher au bloc existant, afin
-# d'instancier 2 réseaux additionnels avec la même architecture / config.
-def build_net():
-    if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium", "test", "testinv", "semihalf", "bigtest"):
-        net = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
-    elif (config['net_type'] == "wideresnet22"):
-        net = net_bank["wideresnet"](n_c=config['im_ch'], depth=22).to(device)
-    elif (config['net_type'] == "wideresnet34"):
-        net = net_bank["wideresnet"](n_c=config['im_ch'], depth=34).to(device)
-    elif (config['net_type'] == "wideresnetLip22"):
-        net = net_bank["wideresnetLip"](n_c=config['im_ch'], Lip_const=config['Lip_const'], depth=22).to(device)
-    else:
-        net = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
-    return net
-
-# f16 : différencie negatifs (raffinés par Langevin depuis le dataset 8x8) / positifs (dataset 16x16)
-f16 = build_net()
-# f32 : différencie negatifs (raffinés par Langevin depuis le dataset 16x16) / positifs (dataset 32x32 réel)
-f32 = build_net()
-
-optim16 = optim_bank[config['optimizer_type']](f16.parameters(), lr=config['lr_init'])
-optim32 = optim_bank[config['optimizer_type']](f32.parameters(), lr=config['lr_init'])
-
 
 print('Processing data...')
 # make tensor of training data
@@ -213,58 +230,36 @@ data = {'cifar10': lambda path, func: datasets.CIFAR10(root=path, transform=func
         'flowers': lambda path, func: datasets.ImageFolder(root=path, transform=func)}
 
 
-# ---- construction du pipeline de transform ----
-if DIM_RESIZE:
-    # 1) on ramène d'abord l'image à sa résolution de détail d'origine
-    #    (ORIG_SZ, ex: 8x8), avec l'interpolation par défaut.
-    # 2) on l'agrandit ensuite vers la résolution finale (config['im_sz'],
-    #    ex: 32x32) en mode NEAREST : chaque pixel d'origine est dupliqué
-    #    en bloc (facteur = im_sz / ORIG_SZ, ex: 32/8 = 4 -> blocs 4x4).
-    resize_steps = [
-        tr.Resize(ORIG_SZ),
-        tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
-    ]
-    print('DIM_RESIZE actif : {} -> {} (blocs {}x{}, interpolation nearest)'.format(
-        ORIG_SZ, config['im_sz'],
-        config['im_sz'] // ORIG_SZ, config['im_sz'] // ORIG_SZ))
-else:
-    resize_steps = [tr.Resize(config['im_sz'])]
+def build_level_transform(res, is_final):
+    """Pipeline de transform pour un niveau de résolution donné.
+    - niveaux intermédiaires : downsample à `res` puis ré-agrandissement en blocs
+      (nearest) vers config['im_sz'].
+    - dernier niveau : image à sa vraie résolution finale, sans effet "blocky"."""
+    if is_final:
+        resize_steps = [tr.Resize(config['im_sz'])]
+    else:
+        resize_steps = [
+            tr.Resize(res),
+            tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
+        ]
+    return tr.Compose(resize_steps + [
+        tr.CenterCrop(config['im_sz']),
+        tr.ToTensor(),
+        tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
 
-transform = tr.Compose(resize_steps + [
-                        tr.CenterCrop(config['im_sz']),
-                        tr.ToTensor(),
-                        tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
 
-q = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform)]).to(device)
+# ── un dataset (positifs) par niveau de la cascade ──────────────────────────────
+level_data = []
+for idx, res in enumerate(CASCADE_RESOLUTIONS):
+    is_final = (idx == N_LEVELS - 1)
+    transform_res = build_level_transform(res, is_final)
+    ds = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform_res)]).to(device)
+    level_data.append(ds)
+    tag = 'résolution réelle' if is_final else 'blocky {0}x{0} -> {1}x{1}'.format(res, config['im_sz'])
+    print('Dataset niveau {} (détail {}) [{}] : {} images'.format(idx, res, tag, ds.shape[0]))
 
-#print size of dataset 
-print('Dataset size:', q.shape[0])
-
-# ============================================================ #
-# ## NOUVEAU : pipelines + tenseurs pour 16x16 et 32x32 réel ## #
-# ============================================================ #
-# q16 : dataset downsamplé à MID_SZ (16) puis ré-agrandi en blocs vers im_sz.
-#       Sert de POSITIF pour f16.
-transform16 = tr.Compose([
-    tr.Resize(MID_SZ),
-    tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
-
-# q32_true : dataset à sa vraie résolution (im_sz), sans downsample/upsample.
-#            Sert de POSITIF pour f32.
-transform32_true = tr.Compose([
-    tr.Resize(config['im_sz']),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    tr.Normalize(tuple(0.5*t.ones(config['im_ch'])), tuple(0.5*t.ones(config['im_ch'])))])
-
-q16 = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform16)]).to(device)
-q32_true = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform32_true)]).to(device)
-
-print('Dataset size (16x16 -> {}x{} blocky):'.format(config['im_sz'], config['im_sz']), q16.shape[0])
-print('Dataset size ({}x{} réel):'.format(config['im_sz'], config['im_sz']), q32_true.shape[0])
+# alias pour compatibilité avec le code "niveau 0" (sample_q, s_t_0, ...)
+q = level_data[0]
 
 
 def make_freq_mask(sz, band, device):
@@ -302,11 +297,11 @@ def sample_freq_noise(batch_size, band='mixed'):
         filtered[current_inds] = fft.ifft2(freq[current_inds] * mask).real
 
     return filtered / (filtered.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-8)
+
 # initialize persistent images from noise (one persistent image for each data image)
-# s_t_0 is used when init_type == 'persistent' in sample_s_t()
+# s_t_0 is used when init_type == 'persistent' in sample_s_t() -- uniquement pour le niveau 0
 if FFT_NOISE:
     s_t_0 = sample_freq_noise(q.shape[0], band='mixed')
-
 else :
     s_t_0 = 2 * t.rand_like(q) - 1
 
@@ -327,6 +322,8 @@ def sample_q(batch_size = config['batch_size']):
 
 
 # initialize and update images with langevin dynamics to obtain samples from finite-step MCMC distribution s_t
+# (utilisé uniquement pour le niveau 0 de la cascade : c'est le seul qui part du bruit /
+#  d'un buffer persistant, exactement comme le modèle "noise -> data" d'origine)
 def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size']):
     # get initial mcmc states for langevin updates ("persistent", "data", "uniform", or "gaussian")
     def sample_s_t_0():
@@ -382,12 +379,10 @@ def sample_s_t(L, init_type, update_s_t_0=True, batch_size=config['batch_size'])
     return x_s_t.detach(), r_s_t.squeeze() / L
 
 
-# ============================================================ #
-# ## NOUVEAU : Langevin pour f16/f32, init SANS bruit,        ##
-# ## directement depuis un batch réel du dataset "source"     ##
-# ## (résolution inférieure), puis pas de Langevin classiques ##
-# ## (bruit epsilon à chaque pas, comme dans sample_s_t).     ##
-# ============================================================ #
+# ── Langevin générique pour les niveaux >= 1 de la cascade ──────────────────────
+# Init SANS bruit, directement depuis un batch réel du dataset "source" (résolution
+# du niveau précédent), puis L pas de Langevin classiques (bruit epsilon à chaque
+# pas, comme dans sample_s_t). Réutilisé pour chaque transition de la cascade.
 def sample_s_t_from_source(net, source_data, L, batch_size=config['batch_size']):
     # init déterministe : un batch réel pris tel quel dans source_data (pas de bruit ajouté)
     x_s_t_0, _ = sample_image_set(source_data, batch_size=batch_size)
@@ -459,7 +454,7 @@ def sample_s_tlongrun(f, config, device, init_type, batch_size):
 # ## TRAINING LOOP ## #
 #######################
 
-# containers for diagnostic records (see Section 3)
+# containers for diagnostic records (see Section 3) -- niveau 0 (comportement d'origine)
 d_s_t_record = t.zeros(config['num_train_iters']).to(device)  # energy difference between positive and negative samples
 r_s_t_record = t.zeros(config['num_train_iters']).to(device)  # average image gradient magnitude along Langevin path
 fid_record = t.zeros(config['num_train_iters']).to(device)  # FID score
@@ -475,16 +470,18 @@ csv_file_path = EXP_DIR + 'plots/' + 'training_metrics.csv'
 last_csv_written = 0
 stability_window = 2
 
-# ---- NOUVEAU : records diagnostiques légers pour f16 et f32 ----
-d_s_t_16_record = t.zeros(config['num_train_iters']).to(device)
-d_s_t_32_record = t.zeros(config['num_train_iters']).to(device)
-r_s_t_16_record = t.zeros(config['num_train_iters']).to(device)
-r_s_t_32_record = t.zeros(config['num_train_iters']).to(device)
+# ── records diagnostiques génériques pour les niveaux >= 1 de la cascade ────────
+# un tenseur par niveau, indexé par le numéro du niveau (1 .. N_LEVELS-1)
+cascade_d_s_t_record = {lvl: t.zeros(config['num_train_iters']).to(device) for lvl in range(1, N_LEVELS)}
+cascade_r_s_t_record = {lvl: t.zeros(config['num_train_iters']).to(device) for lvl in range(1, N_LEVELS)}
+
 
 def save_full_checkpoint(iteration_idx):
     iter_done = iteration_idx + 1
     checkpoint = {
         'iter': iter_done,
+        'cascade_resolutions': CASCADE_RESOLUTIONS,
+        'cascade_steps': CASCADE_STEPS,
         'model_state_dict': f.state_dict(),
         'optimizer_state_dict': optim.state_dict(),
         's_t_0': s_t_0.detach().cpu(),
@@ -498,16 +495,15 @@ def save_full_checkpoint(iteration_idx):
         'last_csv_written': last_csv_written,
         'config': config,
         'lip_const_record': lip_const_record[:iter_done].detach().cpu(),
-        # ---- NOUVEAU : on sauvegarde aussi f16 et f32 dans le même checkpoint ----
-        'model16_state_dict': f16.state_dict(),
-        'optimizer16_state_dict': optim16.state_dict(),
-        'model32_state_dict': f32.state_dict(),
-        'optimizer32_state_dict': optim32.state_dict(),
-        'd_s_t_16_record': d_s_t_16_record[:iter_done].detach().cpu(),
-        'd_s_t_32_record': d_s_t_32_record[:iter_done].detach().cpu(),
-        'r_s_t_16_record': r_s_t_16_record[:iter_done].detach().cpu(),
-        'r_s_t_32_record': r_s_t_32_record[:iter_done].detach().cpu(),
     }
+    # ── ajout générique des niveaux >= 1 de la cascade ──
+    for lvl in range(1, N_LEVELS):
+        res = CASCADE_RESOLUTIONS[lvl]
+        checkpoint['model_res{}_state_dict'.format(res)] = nets[lvl].state_dict()
+        checkpoint['optimizer_res{}_state_dict'.format(res)] = optims[lvl].state_dict()
+        checkpoint['d_s_t_res{}_record'.format(res)] = cascade_d_s_t_record[lvl][:iter_done].detach().cpu()
+        checkpoint['r_s_t_res{}_record'.format(res)] = cascade_r_s_t_record[lvl][:iter_done].detach().cpu()
+
     t.save(checkpoint, EXP_DIR + 'checkpoints/' + 'last_checkpoint.pth')
 
 
@@ -526,15 +522,16 @@ def compute_instability_index(i):
 
     return 0.5 * (fxst_cv + fxq_cv)
 
-print('Training has started.')
+print('Training has started. Cascade : {}'.format(' -> '.join(str(r) for r in CASCADE_RESOLUTIONS)))
 for i in range(start_iter, config['num_train_iters']):
 
-    # obtain positive and negative samples
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── NIVEAU 0 : bruit -> première résolution (comportement d'origine) ──
+    # ═══════════════════════════════════════════════════════════════════════
     x_q = sample_q()
     x_s_t, r_s_t = sample_s_t(L=config['num_shortrun_steps'], init_type=config['shortrun_init'])
 
     # calculate ML computational loss d_s_t (Section 3) for data and shortrun samples
-
     logits_q = f(x_q)
     logits_s = f(x_s_t)
 
@@ -588,48 +585,47 @@ for i in range(start_iter, config['num_train_iters']):
     print(f"Iteration {i+1}: f(x_q)={f_x_q_record[i]:.4f}, f(x_s_t)={f_x_st_record[i]:.4f}")
     instability_record[i] = compute_instability_index(i)
 
-    # ================================================================ #
-    # ## NOUVEAU : entraînement en parallèle de f16 (8x8 -> 16x16)   ## #
-    # ================================================================ #
-    # positifs : dataset downsamplé/blocky à 16x16 (+ bruit comme sample_q)
-    x_q16 = sample_image_set(q16)[0] + config['data_epsilon'] * t.randn_like(x_q)
-    # négatifs : init sans bruit depuis le dataset 8x8 (q), puis pas de Langevin
-    x_neg_8to16, r_s_t_16 = sample_s_t_from_source(f16, q, L=MEDIUM_SHORTRUN_STEPS)
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── NIVEAUX >= 1 de la cascade : boucle générique sur chaque transition ─
+    # (résolution[lvl-1] -> résolution[lvl], entraînement simple type contraste
+    #  d_s_t = f(positif) - f(négatif), sans HKR/regularize, comme f16/f32
+    #  dans le code d'origine) ─
+    # ═══════════════════════════════════════════════════════════════════════
+    x_neg_per_level = {}  # pour la visualisation plus bas
+    for lvl in range(1, N_LEVELS):
+        net_lvl = nets[lvl]
+        optim_lvl = optims[lvl]
+        res_prev = CASCADE_RESOLUTIONS[lvl - 1]
+        res_lvl = CASCADE_RESOLUTIONS[lvl]
+        steps_lvl = CASCADE_STEPS[lvl - 1]
+        source_data = level_data[lvl - 1]   # dataset du niveau précédent (pour init des négatifs)
+        positive_data = level_data[lvl]     # dataset du niveau courant (positifs)
 
-    f_x_q16 = f16(x_q16).mean()
-    f_x_neg16 = f16(x_neg_8to16).mean()
-    d_s_t_16 = f_x_q16 - f_x_neg16
+        # positifs : dataset du niveau courant (+ bruit comme sample_q)
+        x_q_lvl = sample_image_set(positive_data)[0] + config['data_epsilon'] * t.randn_like(x_q)
+        # négatifs : init sans bruit depuis le dataset du niveau précédent, puis Langevin
+        x_neg_lvl, r_s_t_lvl = sample_s_t_from_source(net_lvl, source_data, L=steps_lvl)
 
-    optim16.zero_grad()
-    d_s_t_16.backward()
-    optim16.step()
+        f_x_q_lvl = net_lvl(x_q_lvl).mean()
+        f_x_neg_lvl = net_lvl(x_neg_lvl).mean()
+        d_s_t_lvl = f_x_q_lvl - f_x_neg_lvl
 
-    d_s_t_16_record[i] = d_s_t_16.detach()
-    r_s_t_16_record[i] = r_s_t_16
+        optim_lvl.zero_grad()
+        d_s_t_lvl.backward()
+        optim_lvl.step()
 
-    # ================================================================ #
-    # ## NOUVEAU : entraînement en parallèle de f32 (16x16 -> 32x32) ## #
-    # ================================================================ #
-    # positifs : dataset à sa vraie résolution (+ bruit comme sample_q)
-    x_q32 = sample_image_set(q32_true)[0] + config['data_epsilon'] * t.randn_like(x_q)
-    # négatifs : init sans bruit depuis le dataset 16x16 (q16), puis pas de Langevin
-    x_neg_16to32, r_s_t_32 = sample_s_t_from_source(f32, q16, L=LAST_SHORTRUN_STEPS)
+        cascade_d_s_t_record[lvl][i] = d_s_t_lvl.detach()
+        cascade_r_s_t_record[lvl][i] = r_s_t_lvl
+        x_neg_per_level[lvl] = x_neg_lvl
 
-    f_x_q32 = f32(x_q32).mean()
-    f_x_neg32 = f32(x_neg_16to32).mean()
-    d_s_t_32 = f_x_q32 - f_x_neg32
+        print('{:>6d}   [{}->{}]  d_s_t={:>14.9f}   r_s_t={:>14.9f}'.format(
+            i+1, res_prev, res_lvl, d_s_t_lvl.detach().data, r_s_t_lvl))
 
-    optim32.zero_grad()
-    d_s_t_32.backward()
-    optim32.step()
+        # anneal learning rate (même politique que le niveau 0)
+        for lr_gp in optim_lvl.param_groups:
+            lr_gp['lr'] = max(config['lr_min'], lr_gp['lr'] * config['lr_decay'])
 
-    d_s_t_32_record[i] = d_s_t_32.detach()
-    r_s_t_32_record[i] = r_s_t_32
-
-    print('{:>6d}   [8->16]  d_s_t={:>14.9f}   r_s_t={:>14.9f}'.format(i+1, d_s_t_16.detach().data, r_s_t_16))
-    print('{:>6d}   [16->32] d_s_t={:>14.9f}   r_s_t={:>14.9f}'.format(i+1, d_s_t_32.detach().data, r_s_t_32))
-
-    # compute FID if available
+    # compute FID if available (uniquement pour le niveau 0, comme dans le code d'origine)
     if feature_extractor is not None and (i == 0 or (i + 1) % config.get('log_freq', 100) == 0):
         if (i==0):
             # set initial FID to a large value 
@@ -647,14 +643,8 @@ for i in range(start_iter, config['num_train_iters']):
             if fid_score > 500 : fid_score = 500 # cap FID at 100 for better visualization of training progress
             fid_record[i] = t.tensor(fid_score).to(device)
 
-    # anneal learning rate
+    # anneal learning rate (niveau 0)
     for lr_gp in optim.param_groups:
-        lr_gp['lr'] = max(config['lr_min'], lr_gp['lr'] * config['lr_decay'])
-
-    # ---- NOUVEAU : même politique d'annealing pour f16 et f32 ----
-    for lr_gp in optim16.param_groups:
-        lr_gp['lr'] = max(config['lr_min'], lr_gp['lr'] * config['lr_decay'])
-    for lr_gp in optim32.param_groups:
         lr_gp['lr'] = max(config['lr_min'], lr_gp['lr'] * config['lr_decay'])
 
     # print and save learning info
@@ -668,10 +658,13 @@ for i in range(start_iter, config['num_train_iters']):
         with open(csv_file_path, 'a', newline='') as csv_file:
             csv_writer = csv.writer(csv_file)
             if not csv_exists:
-                csv_writer.writerow(['iteration', 'FID', 'DST', 'RST', 'Instability', 'fxq', 'fxst', 'Lip_const',
-                                      'DST_16', 'RST_16', 'DST_32', 'RST_32'])
+                header = ['iteration', 'FID', 'DST', 'RST', 'Instability', 'fxq', 'fxst', 'Lip_const']
+                for lvl in range(1, N_LEVELS):
+                    res = CASCADE_RESOLUTIONS[lvl]
+                    header += ['DST_res{}'.format(res), 'RST_res{}'.format(res)]
+                csv_writer.writerow(header)
             for j in range(last_csv_written, i + 1):
-                csv_writer.writerow([
+                row = [
                     j + 1,
                     float(fid_record[j].detach().cpu()),
                     float(d_s_t_record[j].detach().cpu()),
@@ -680,36 +673,43 @@ for i in range(start_iter, config['num_train_iters']):
                     float(f_x_q_record[j].detach().cpu()),
                     float(f_x_st_record[j].detach().cpu()),
                     float(lip_const_record[j].detach().cpu()),
-                    # ---- NOUVEAU : colonnes CSV pour f16 / f32 ----
-                    float(d_s_t_16_record[j].detach().cpu()),
-                    float(r_s_t_16_record[j].detach().cpu()),
-                    float(d_s_t_32_record[j].detach().cpu()),
-                    float(r_s_t_32_record[j].detach().cpu()),
-                ])
+                ]
+                for lvl in range(1, N_LEVELS):
+                    row += [
+                        float(cascade_d_s_t_record[lvl][j].detach().cpu()),
+                        float(cascade_r_s_t_record[lvl][j].detach().cpu()),
+                    ]
+                csv_writer.writerow(row)
         last_csv_written = i + 1
 
-        # visualize synthesized images
+        # visualize synthesized images (niveau 0)
         plot_ims(EXP_DIR + 'shortrun/' + 'x_s_t_{:>06d}.png'.format(i+1), x_s_t)
         if config['shortrun_init'] == 'persistent':
             plot_ims(EXP_DIR + 'shortrun/' + 'x_s_t_0_{:>06d}.png'.format(i+1), s_t_0[0:config['batch_size']])
 
-        # ---- NOUVEAU : visualisation des sorties de f16 / f32 ----
-        plot_ims(EXP_DIR + 'shortrun/' + 'x_neg_8to16_{:>06d}.png'.format(i+1), x_neg_8to16)
-        plot_ims(EXP_DIR + 'shortrun/' + 'x_neg_16to32_{:>06d}.png'.format(i+1), x_neg_16to32)
+        # visualisation générique des négatifs pour chaque niveau >= 1
+        for lvl in range(1, N_LEVELS):
+            res_prev = CASCADE_RESOLUTIONS[lvl - 1]
+            res_lvl = CASCADE_RESOLUTIONS[lvl]
+            plot_ims(EXP_DIR + 'shortrun/' + 'x_neg_{}to{}_{:>06d}.png'.format(res_prev, res_lvl, i+1),
+                     x_neg_per_level[lvl])
 
-        # save network weights
+        # save network weights (niveau 0)
         t.save(f.state_dict(), EXP_DIR + 'checkpoints/' + 'net_{:>06d}.pth'.format(i + 1))
-        # ---- NOUVEAU : sauvegarde des poids de f16 / f32 ----
-        t.save(f16.state_dict(), EXP_DIR + 'checkpoints/' + 'net16_{:>06d}.pth'.format(i + 1))
-        t.save(f32.state_dict(), EXP_DIR + 'checkpoints/' + 'net32_{:>06d}.pth'.format(i + 1))
+        # sauvegarde générique des poids pour chaque niveau >= 1
+        for lvl in range(1, N_LEVELS):
+            res = CASCADE_RESOLUTIONS[lvl]
+            t.save(nets[lvl].state_dict(),
+                   EXP_DIR + 'checkpoints/' + 'net_res{}_{:>06d}.pth'.format(res, i + 1))
+
         # save full training checkpoint for exact resume
         save_full_checkpoint(i)
-        # plot diagnostics for energy difference d_s_t and gradient magnitude r_t
+        # plot diagnostics for energy difference d_s_t and gradient magnitude r_t (niveau 0)
         if (i + 1) > 1:
             plot_diagnostics(i, d_s_t_record, r_s_t_record, fid_record, f_x_q_record, f_x_st_record,
                              instability_record, EXP_DIR + 'plots/')
 
-    # sample longrun chains to diagnose model steady-state
+    # sample longrun chains to diagnose model steady-state (niveau 0)
     if config['log_longrun'] and (i+1) % config['log_longrun_freq'] == 0:
         print('{:>6d}   Generating long-run samples. (L={:>6d} MCMC steps)'.format(i+1, config['num_longrun_steps']))
         x_p_theta = sample_s_t(L=config['num_longrun_steps'], init_type=config['longrun_init'], update_s_t_0=False)[0]

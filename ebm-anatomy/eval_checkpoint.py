@@ -10,11 +10,6 @@ import torch.fft as fft
 from ebm_utils import*
 from nets import *
 from utilfid import *
-
-# =========================
-# PARAMETRES (EN HAUT)
-# =========================
-
 EXP_DIR = './out_data/Expe/cifar10_lang20_dim8x8up16x16up32x32/'
 
 # find any json config file in the code directory of the experiment
@@ -34,11 +29,12 @@ LONGRUN_INIT = 'uniform'  # 'uniform', 'gaussian', or 'fft'
 FFT_NOISE_BANDS = ('low', 'mid', 'high')  # pour init_type='fft'
 SEED = 42
 
-# Calcule le FID toutes les FID_EVAL_INTERVAL itérations Langevin.
-# Mettre à None pour désactiver (comportement original).
+
 FID_EVAL_INTERVAL = 50   # ex: 50, 100, 200 …
-DIM_RESIZE = True # si True, on ramène d'abord l'image à ORIG_SZ, puis on l'agrandit (ORIG_SZ devient la résolution des détails de l'image)
-ORIG_SZ = 8  # résolution de détail de l'image
+
+# has to follow what was used during training (see train_data.py)
+DIM_RESIZE = True 
+ORIG_SZ = 8 
 
 # -------- load config/device --------
 with open(CONFIG_FILE) as file:

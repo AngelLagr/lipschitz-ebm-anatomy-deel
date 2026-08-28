@@ -1,20 +1,6 @@
 #####################################################################
-# ## EVAL CASCADE COARSE-TO-FINE (f 8x8 -> f16 16x16 -> f32 32x32) ##
+# ## EVAL CASCADE COARSE-TO-FINE (multi-resolution EBM cascade)   ##
 #####################################################################
-#
-# Ce script évalue le modèle produit par train_coarsetofine.py.
-# Il charge f / f16 / f32 depuis un checkpoint (soit le dernier
-# checkpoint complet, soit un checkpoint à une itération précise),
-# génère des images en cascade (chaque étage part du résultat
-# Langevin de l'étage précédent, PAS d'un nouveau bruit), et pour
-# chaque résolution (8x8, 16x16, 32x32) :
-#   - calcule le FID face à la vraie distribution de cette résolution
-#   - sauvegarde une grille d'images
-#   - (optionnel) trace FID / gradient en fonction du pas Langevin
-#
-# =========================
-# PARAMETRES (EN HAUT)
-# =========================
 
 import os
 import json
@@ -30,26 +16,33 @@ from ebm_utils import *
 from nets import *
 from utilfid import *
 
-EXP_DIR = './out_data/Expe/cifar10_lang30_dim8x8up16x16up32x32/'
+EXP_DIR = './out_data/Expe/cifar10_lang10_dim4x8x16x32/'
 
-# =========================
-# SELECTION DU CHECKPOINT
-# =========================
-# Laisser à None pour charger le dernier checkpoint complet
-# (checkpoints/last_checkpoint.pth), qui contient f, f16 et f32
-# ensemble ainsi que le lip_const enregistré.
+# Must match the resolutions used to train the checkpoint being loaded.
+CASCADE_RESOLUTIONS = [2,4,8, 16, 32]
+
+# Longrun Langevin steps for the very first stage (noise -> CASCADE_RESOLUTIONS[0])
+L_STEPS_STAGE0 = 200
+
+# Longrun Langevin steps for every subsequent transition (len == len(CASCADE_RESOLUTIONS) - 1)
+CASCADE_STEPS = [15, 10, 7, 7]
+
+
+# Leave at None to load the latest full checkpoint
+# (checkpoints/last_checkpoint.pth), which contains every stage of the
+# cascade together with the recorded lip_const.
 #
-# Mettre un numéro d'itération précis (ex: 5000) pour charger les
-# poids sauvegardés à cette itération, via les fichiers
-# net_XXXXXX.pth / net16_XXXXXX.pth / net32_XXXXXX.pth (ce sont ceux
-# écrits par train_data.py à chaque `log_freq` itérations).
-CHECKPOINT_ITER = 37000   # ex: 5000
+# Set a specific iteration number (e.g. 5000) to load the weights saved
+# at that iteration, via the files net_XXXXXX.pth (stage 0) and
+# net_resR_XXXXXX.pth (subsequent stages, R = resolution), which are the
+# ones written by train_data.py every `log_freq` iterations.
+CHECKPOINT_ITER = 10000   # e.g. 5000
 
 CKPT_DIR = EXP_DIR + 'checkpoints/'
 CHECKPOINT_FILE = CKPT_DIR + 'last_checkpoint.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 
-# trouve le json de config sauvegardé pendant l'entraînement
+# find the config json saved during training
 CONFIG_FILE = None
 for file in os.listdir(EXP_DIR + 'code/'):
     if file.endswith('.json'):
@@ -58,66 +51,75 @@ for file in os.listdir(EXP_DIR + 'code/'):
 if CONFIG_FILE is None:
     raise FileNotFoundError(f"No JSON config file found in {EXP_DIR}code/")
 
-# tailles utilisées à l'entraînement (doivent matcher train_coarsetofine.py)
-ORIG_SZ = 8    # résolution de détail "coarse" (stage f)
-MID_SZ = 16    # résolution de détail "mid"    (stage f16)
-# la résolution finale (stage f32) est config['im_sz']
-
 FID_BATCH_SIZE = 3000
 
-# nombre de pas Langevin par étage (peuvent être différents de l'entraînement,
-# on veut typiquement un "long-run" plus long pour bien évaluer chaque stage)
-L_STEPS_STAGE1 = 300    # bruit          -> 8x8 (f)
-L_STEPS_STAGE2 = 10    # sortie stage 1 -> 16x16 (f16)
-L_STEPS_STAGE3 = 3    # sortie stage 2 -> 32x32 (f32)
+# init of the very first stage (pure noise)
+STAGE0_INIT = 'uniform'  # 'uniform', 'gaussian', or 'fft'
+FFT_NOISE_BANDS = ('low', 'mid', 'high')
 
-# init du tout premier stage (bruit pur)
-STAGE1_INIT = 'uniform'  # 'uniform', 'gaussian', ou 'fft'
-FFT_NOISE_BANDS = ('low', 'mid', 'high') 
-
-# calcule le FID intermédiaire tous les N pas à l'intérieur de chaque étage
-# (None pour désactiver et ne calculer que le FID final de chaque étage)
-FID_EVAL_INTERVAL = 50
-
-N_IMAGES_PLOT = 16  # nombre d'images dans les grilles sauvegardées
+# compute an intermediate FID every N steps inside each stage.
+# One value per resolution in CASCADE_RESOLUTIONS (len must match).
+# Use None for a given stage to disable intermediate FID there and only
+# compute its final FID (useful for very cheap/low-res stages, or to
+# save time on stages you don't care to inspect in detail).
+#
+# Example matching CASCADE_RESOLUTIONS = [2, 4, 8, 16, 32]:
+#   CASCADE_FID_EVAL_INTERVAL = [None, None, 10, 10, 5]
+CASCADE_FID_EVAL_INTERVAL = [50, 2, 2, 2, 1]
+ 
+N_IMAGES_PLOT = 16  # number of images in the saved grids
 SEED = 42
-
-# le dossier de sortie inclut l'itération choisie pour ne pas écraser
-# les résultats d'une éval à l'autre
+ 
+# the output folder includes the chosen iteration so results from
+# different evals don't overwrite each other
 _ckpt_tag = f'iter_0{CHECKPOINT_ITER:06d}' if CHECKPOINT_ITER is not None else 'last'
 OUT_DIR = EXP_DIR + f'eval_cascade/{_ckpt_tag}/'
 os.makedirs(OUT_DIR, exist_ok=True)
-
-
+ 
+ 
 # =========================
 # SETUP
 # =========================
-
+ 
 with open(CONFIG_FILE) as file:
     config = json.load(file)
-
+ 
+# cascade validation
+assert CASCADE_RESOLUTIONS[-1] == config['im_sz'], \
+    'The last value of CASCADE_RESOLUTIONS must equal config["im_sz"] ({}).'.format(config['im_sz'])
+assert len(CASCADE_STEPS) == len(CASCADE_RESOLUTIONS) - 1, \
+    'CASCADE_STEPS must contain exactly len(CASCADE_RESOLUTIONS)-1 values (one per transition).'
+for a, b in zip(CASCADE_RESOLUTIONS[:-1], CASCADE_RESOLUTIONS[1:]):
+    assert a < b, 'CASCADE_RESOLUTIONS must be strictly increasing ({} >= {}).'.format(a, b)
+assert len(CASCADE_FID_EVAL_INTERVAL) == len(CASCADE_RESOLUTIONS), \
+    'CASCADE_FID_EVAL_INTERVAL must contain exactly one value per resolution in CASCADE_RESOLUTIONS ' \
+    '(len={} expected, got {}).'.format(len(CASCADE_RESOLUTIONS), len(CASCADE_FID_EVAL_INTERVAL))
+ 
+N_LEVELS = len(CASCADE_RESOLUTIONS)
+STAGE_LABELS = ['Stage {} ({}x{})'.format(idx, res, res) for idx, res in enumerate(CASCADE_RESOLUTIONS)]
+ 
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
-
+ 
 WConstrained_enabled = config.get('Wasserstein_LipConstrained', False)
-
+ 
 t.manual_seed(SEED)
 if t.cuda.is_available():
     t.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
-
-
+ 
+ 
 # =========================
-# CONSTRUCTION DES 3 RESEAUX (même logique que train_coarsetofine.py)
+# BUILD THE N_LEVELS NETWORKS (same logic as train_data.py)
 # =========================
-
+ 
 net_bank = {'bigtest': BigTestModel, 'semihalf': Semihalf, 'test': TestModel, 'vanilla': VanillaNet,
             'vanillaLip': VanillaNetLLip, 'nonlocal': NonlocalNet, 'vanillaHalfLip': VanillaNetHalfLip,
             'vanillaLip2': VanillaNetLLip2, 'vanilla2': VanillaNet2, 'wideresnet': Wide_ResNet,
             'wideresnetLip': Wide_ResNet_LLip, 'wideresnetLip_Logsumexp': Wide_ResNet_LLip_Logsumexp,
             'orthogonium': VanillaNetOrthogonium}
-
-
+ 
+ 
 def build_net():
     if config['net_type'] in ("vanillaLip", "vanillaLip2", "wideresnetLip", "orthogonium", "test", "testinv", "semihalf", "bigtest"):
         net = net_bank[config['net_type']](n_c=config['im_ch'], Lip_const=config['Lip_const']).to(device)
@@ -130,147 +132,146 @@ def build_net():
     else:
         net = net_bank[config['net_type']](n_c=config['im_ch']).to(device)
     return net
-
-
+ 
+ 
 def list_available_checkpoints():
-    """Liste les numéros d'itération disponibles, déduits des fichiers
-    net_XXXXXX.pth présents dans le dossier checkpoints/."""
+    """List the iteration numbers available, inferred from the net_XXXXXX.pth
+    files present in the checkpoints/ folder (stage 0 weights)."""
     iters = []
     if not os.path.isdir(CKPT_DIR):
         return iters
     for fname in os.listdir(CKPT_DIR):
-        if fname.startswith('net_') and fname.endswith('.pth'):
+        if fname.startswith('net_') and fname.endswith('.pth') and not fname.startswith('net_res'):
             middle = fname[len('net_'):-len('.pth')]
             if middle.isdigit():
                 iters.append(int(middle))
     return sorted(iters)
-
-
-print('Building networks f, f16, f32...')
-f = build_net()
-f16 = build_net()
-f32 = build_net()
-
+ 
+ 
+print('Building {} cascade networks: {}'.format(N_LEVELS, ' -> '.join(str(r) for r in CASCADE_RESOLUTIONS)))
+nets = [build_net() for _ in range(N_LEVELS)]
+ 
 lip_const = None
-
+ 
 if CHECKPOINT_ITER is None:
-    # -------- charge le dernier checkpoint complet --------
+    # -------- load the latest full checkpoint --------
     print(f'Loading latest full checkpoint: {CHECKPOINT_FILE}')
     checkpoint = t.load(CHECKPOINT_FILE, map_location=device)
-
+ 
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        f.load_state_dict(checkpoint['model_state_dict'])
-        f16.load_state_dict(checkpoint['model16_state_dict'])
-        f32.load_state_dict(checkpoint['model32_state_dict'])
+        nets[0].load_state_dict(checkpoint['model_state_dict'])
+        for lvl in range(1, N_LEVELS):
+            res = CASCADE_RESOLUTIONS[lvl]
+            key = 'model_res{}_state_dict'.format(res)
+            if key not in checkpoint:
+                raise RuntimeError(
+                    'Checkpoint missing key "{}" for resolution {}. '
+                    'Does CASCADE_RESOLUTIONS match the resolutions used to train this checkpoint?'.format(key, res))
+            nets[lvl].load_state_dict(checkpoint[key])
         if WConstrained_enabled:
             lip_const = float(checkpoint['lip_const_record'][-1])
-        print(f"Checkpoint chargé (iter={checkpoint.get('iter', '?')}).")
+        print(f"Checkpoint loaded (iter={checkpoint.get('iter', '?')}).")
     else:
-        raise RuntimeError('Ce script attend un checkpoint COMPLET (last_checkpoint.pth) '
-                            'contenant model_state_dict / model16_state_dict / model32_state_dict.')
+        raise RuntimeError('This script expects a FULL checkpoint (last_checkpoint.pth) '
+                            'containing model_state_dict / model_res{R}_state_dict for every stage.')
 else:
-    # -------- charge les poids sauvegardés à une itération précise --------
+    # -------- load the weights saved at a specific iteration --------
     available = list_available_checkpoints()
     if CHECKPOINT_ITER not in available:
         raise FileNotFoundError(
-            f"Aucun checkpoint trouvé pour l'itération {CHECKPOINT_ITER} dans {CKPT_DIR}.\n"
-            f"Itérations disponibles : {available}"
+            f"No checkpoint found for iteration {CHECKPOINT_ITER} in {CKPT_DIR}.\n"
+            f"Available iterations: {available}"
         )
-
-    net_file = CKPT_DIR + 'net_{:>06d}.pth'.format(CHECKPOINT_ITER)
-    net16_file = CKPT_DIR + 'net16_{:>06d}.pth'.format(CHECKPOINT_ITER)
-    net32_file = CKPT_DIR + 'net32_{:>06d}.pth'.format(CHECKPOINT_ITER)
-
+ 
     print(f'Loading checkpoint at iter {CHECKPOINT_ITER} :')
-    print(f'  {net_file}')
-    print(f'  {net16_file}')
-    print(f'  {net32_file}')
-
-    f.load_state_dict(t.load(net_file, map_location=device))
-    f16.load_state_dict(t.load(net16_file, map_location=device))
-    f32.load_state_dict(t.load(net32_file, map_location=device))
-    # lip_const n'est pas sauvegardé séparément dans ces checkpoints partiels
-    print(f"Checkpoints chargés (iter={CHECKPOINT_ITER}).")
-
-for net in (f, f16, f32):
+    net_file = CKPT_DIR + 'net_{:>06d}.pth'.format(CHECKPOINT_ITER)
+    print(f'  stage 0 ({CASCADE_RESOLUTIONS[0]}x{CASCADE_RESOLUTIONS[0]}) : {net_file}')
+    nets[0].load_state_dict(t.load(net_file, map_location=device))
+ 
+    for lvl in range(1, N_LEVELS):
+        res = CASCADE_RESOLUTIONS[lvl]
+        net_res_file = CKPT_DIR + 'net_res{}_{:>06d}.pth'.format(res, CHECKPOINT_ITER)
+        print(f'  stage {lvl} ({res}x{res}) : {net_res_file}')
+        nets[lvl].load_state_dict(t.load(net_res_file, map_location=device))
+ 
+    # lip_const is not saved separately in these partial checkpoints
+    print(f"Checkpoints loaded (iter={CHECKPOINT_ITER}).")
+ 
+for net in nets:
     net.eval()
     net.to(device)
 t.cuda.empty_cache()
-
-
+ 
+ 
 # =========================
-# DONNEES REELLES DE REFERENCE (une par résolution, pour le FID)
+# REAL REFERENCE DATA (one per resolution, for FID)
 # =========================
-
+ 
 data = {
     'cifar10': lambda path, func: datasets.CIFAR10(root=path, transform=func, download=True),
     'mnist': lambda path, func: datasets.MNIST(root=path, transform=func, download=True),
     'flowers': lambda path, func: datasets.ImageFolder(root=path, transform=func),
 }
-
+ 
 norm = tr.Normalize(tuple(0.5 * t.ones(config['im_ch'])), tuple(0.5 * t.ones(config['im_ch'])))
-
-# stage 1 (f)   : positif = dataset downsamplé à ORIG_SZ puis remonté en blocs
-transform_8 = tr.Compose([
-    tr.Resize(ORIG_SZ),
-    tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    norm,
-])
-
-# stage 2 (f16) : positif = dataset downsamplé à MID_SZ puis remonté en blocs
-transform_16 = tr.Compose([
-    tr.Resize(MID_SZ),
-    tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    norm,
-])
-
-# stage 3 (f32) : positif = dataset à sa vraie résolution
-transform_32 = tr.Compose([
-    tr.Resize(config['im_sz']),
-    tr.CenterCrop(config['im_sz']),
-    tr.ToTensor(),
-    norm,
-])
-
-print('Loading reference datasets (8x8, 16x16, 32x32)...')
-q8_ref = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform_8)]).to(device)
-q16_ref = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform_16)]).to(device)
-q32_ref = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform_32)]).to(device)
-
-
+ 
+ 
+def build_level_transform(res, is_final):
+    """Transform pipeline for a given cascade resolution.
+    - intermediate levels: downsample to `res` then blocky nearest-neighbour
+      upsampling back to config['im_sz'].
+    - last level: image at its true final resolution, no blockiness."""
+    if is_final:
+        resize_steps = [tr.Resize(config['im_sz'])]
+    else:
+        resize_steps = [
+            tr.Resize(res),
+            tr.Resize(config['im_sz'], interpolation=tr.InterpolationMode.NEAREST),
+        ]
+    return tr.Compose(resize_steps + [
+        tr.CenterCrop(config['im_sz']),
+        tr.ToTensor(),
+        norm,
+    ])
+ 
+ 
+print('Loading reference datasets ({})...'.format(', '.join('{}x{}'.format(r, r) for r in CASCADE_RESOLUTIONS)))
+level_data_ref = []
+for idx, res in enumerate(CASCADE_RESOLUTIONS):
+    is_final = (idx == N_LEVELS - 1)
+    transform_res = build_level_transform(res, is_final)
+    ds = t.stack([x[0] for x in data[config['data']]('./data/' + config['data'], transform_res)]).to(device)
+    level_data_ref.append(ds)
+ 
+ 
 def sample_image_set(image_set, batch_size):
     rand_inds = t.randperm(image_set.shape[0])[:batch_size]
     return image_set[rand_inds]
-
-
+ 
+ 
 with t.no_grad():
-    x_q8_fid = sample_image_set(q8_ref, FID_BATCH_SIZE) + config['data_epsilon'] * t.randn(
-        FID_BATCH_SIZE, *q8_ref.shape[1:], device=device)
-    x_q16_fid = sample_image_set(q16_ref, FID_BATCH_SIZE) + config['data_epsilon'] * t.randn(
-        FID_BATCH_SIZE, *q16_ref.shape[1:], device=device)
-    x_q32_fid = sample_image_set(q32_ref, FID_BATCH_SIZE) + config['data_epsilon'] * t.randn(
-        FID_BATCH_SIZE, *q32_ref.shape[1:], device=device)
-
-# -------- feature extractor pour le FID --------
+    x_q_fid_per_level = []
+    for ds in level_data_ref:
+        x_fid = sample_image_set(ds, FID_BATCH_SIZE) + config['data_epsilon'] * t.randn(
+            FID_BATCH_SIZE, *ds.shape[1:], device=device)
+        x_q_fid_per_level.append(x_fid)
+ 
+# -------- FID feature extractor --------
 if config['data'] == 'mnist':
     feature_extractor = load_mnist_feature_extractor('./fidcheckpoints/mnist_feature_extractor.pth', device)
 elif config['data'] == 'cifar10':
     feature_extractor = InceptionFeatures().half().to(device)
 else:
     feature_extractor = None
-
+ 
 if feature_extractor is None:
-    raise RuntimeError(f"Pas de feature extractor FID disponible pour data='{config['data']}'.")
-
-
+    raise RuntimeError(f"No FID feature extractor available for data='{config['data']}'.")
+ 
+ 
 # =========================
-# BRUIT FREQUENTIEL (pour STAGE1_INIT='fft')
+# FREQUENCY NOISE (for STAGE0_INIT='fft')
 # =========================
-
+ 
 def make_freq_mask(sz, band, device):
     y = t.fft.fftfreq(sz, device=device).reshape(-1, 1)
     x = t.fft.fftfreq(sz, device=device).reshape(1, -1)
@@ -284,8 +285,8 @@ def make_freq_mask(sz, band, device):
     elif band == 'high':
         return 1 - t.exp(-r2 / (2 * 0.15 ** 2))
     raise RuntimeError('Invalid band for frequency mask (use "low", "mid", or "high")')
-
-
+ 
+ 
 def sample_freq_noise(batch_size, band='mixed'):
     if band == 'mixed':
         bands = [random.choice(FFT_NOISE_BANDS) for _ in range(batch_size)]
@@ -293,60 +294,60 @@ def sample_freq_noise(batch_size, band='mixed'):
         bands = [band] * batch_size
     else:
         raise RuntimeError('Invalid band for frequency noise (use "low", "mid", "high", or "mixed")')
-
+ 
     noise = t.randn([batch_size, config['im_ch'], config['im_sz'], config['im_sz']], device=device)
     freq = t.fft.fft2(noise)
     filtered = t.empty_like(noise)
-
+ 
     for current_band in FFT_NOISE_BANDS:
         current_inds = [idx for idx, band_name in enumerate(bands) if band_name == current_band]
         if not current_inds:
             continue
         mask = make_freq_mask(config['im_sz'], current_band, device)[None, None, :, :]
         filtered[current_inds] = t.fft.ifft2(freq[current_inds] * mask).real
-
+ 
     return filtered / (filtered.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-8)
-
-
+ 
+ 
 # =========================
-# LANGEVIN GENERIQUE POUR UN ETAGE DE LA CASCADE
+# GENERIC LANGEVIN FOR A SINGLE CASCADE STAGE
 # =========================
-
+ 
 def langevin_stage(net, x_init, L, fid_eval_interval=None):
     """
-    Fait tourner Langevin avec `net` en partant de `x_init` (déjà à la bonne
-    résolution pixel, pas de bruit ajouté à l'init : soit c'est du vrai bruit
-    (stage 1), soit c'est la sortie de l'étage précédent).
-
-    Retourne :
-      x_final    : état final (device)
-      mean_grads : (L,) numpy, norme moyenne du gradient à chaque pas
-      snapshots  : {step -> tensor cpu} pour le FID intermédiaire
+    Runs Langevin dynamics with `net`, starting from `x_init` (already at
+    the right pixel resolution, no noise added on top of the init: either
+    it is pure noise (stage 0), or it is the output of the previous stage).
+ 
+    Returns:
+      x_final    : final state (device)
+      mean_grads : (L,) numpy array, mean gradient norm at each step
+      snapshots  : {step -> cpu tensor} for intermediate FID computation
     """
     x = t.autograd.Variable(x_init.clone(), requires_grad=True)
     grads = t.zeros(L, x.shape[0])
     snapshots = {}
-
+ 
     for ell in range(L):
         f_val = net(x)
         f_prime = t.autograd.grad(f_val.sum(), [x])[0]
         x.data += -f_prime + config['epsilon'] * t.randn_like(x)
         grads[ell] = f_prime.view(f_prime.shape[0], -1).norm(dim=1).cpu()
-
+ 
         if ell == 0 or (ell + 1) % 10 == 0 or (ell + 1) == L:
             print('  step {} / {}   mean grad={:.6f}'.format(ell + 1, L, grads[ell].mean()), end='\r')
-
+ 
         if fid_eval_interval is not None:
             step_num = ell + 1
             if step_num % fid_eval_interval == 0 or step_num == L:
                 snapshots[step_num] = x.detach().cpu()
     print()
-
+ 
     return x.detach(), grads.mean(dim=1).numpy(), snapshots
-
-
+ 
+ 
 def run_stage_chunked(net, x_init, L, fid_eval_interval=None, chunk_size=1000):
-    """Découpe en chunks pour limiter la mémoire GPU, comme dans eval.py."""
+    """Splits the batch into chunks to limit GPU memory usage, same idea as eval.py."""
     results, snaps_agg = [], {}
     grads_all = []
     n = x_init.shape[0]
@@ -359,13 +360,13 @@ def run_stage_chunked(net, x_init, L, fid_eval_interval=None, chunk_size=1000):
         for step, snap in snaps.items():
             snaps_agg.setdefault(step, []).append(snap)
         t.cuda.empty_cache()
-
+ 
     x_final = t.cat(results, dim=0).to(device)
     mean_grads = np.mean(np.stack(grads_all, axis=0), axis=0) if grads_all else np.array([])
     snaps_agg = {step: t.cat(tensors, dim=0) for step, tensors in snaps_agg.items()}
     return x_final, mean_grads, snaps_agg
-
-
+ 
+ 
 def fid_over_snapshots(snapshots, x_real_ref):
     steps = sorted(snapshots.keys())
     fids = []
@@ -377,83 +378,101 @@ def fid_over_snapshots(snapshots, x_real_ref):
         del snap
         t.cuda.empty_cache()
     return steps, fids
-
-
+ 
+ 
 # =========================
-# GENERATION EN CASCADE
+# CASCADE GENERATION ── generic loop over every stage
 # =========================
-
-print('\n=== STAGE 1 : bruit -> 8x8 (via f) ===')
-if STAGE1_INIT == 'uniform':
+ 
+x_stage_outputs = [None] * N_LEVELS   # final samples per stage
+grads_per_stage = [None] * N_LEVELS   # mean gradient norm curve per stage
+snaps_per_stage = [None] * N_LEVELS   # FID snapshots per stage
+ 
+print('\n=== Stage 0 : noise -> {}x{} (via net 0) ==='.format(CASCADE_RESOLUTIONS[0], CASCADE_RESOLUTIONS[0]))
+if STAGE0_INIT == 'uniform':
     x0 = (2 * t.rand([FID_BATCH_SIZE, config['im_ch'], config['im_sz'], config['im_sz']]) - 1).to(device)
-elif STAGE1_INIT == 'gaussian':
+elif STAGE0_INIT == 'gaussian':
     x0 = t.randn([FID_BATCH_SIZE, config['im_ch'], config['im_sz'], config['im_sz']]).to(device)
-elif STAGE1_INIT == 'fft':
+elif STAGE0_INIT == 'fft':
     x0 = sample_freq_noise(FID_BATCH_SIZE, band='mixed')
 else:
-    raise RuntimeError('STAGE1_INIT invalide (uniform / gaussian / fft)')
-
-x_stage1, grads1, snaps1 = run_stage_chunked(f, x0, L_STEPS_STAGE1, fid_eval_interval=FID_EVAL_INTERVAL)
-
-print('\n=== STAGE 2 : sortie stage1 -> 16x16 (via f16) ===')
-x_stage2, grads2, snaps2 = run_stage_chunked(f16, x_stage1, L_STEPS_STAGE2, fid_eval_interval=FID_EVAL_INTERVAL)
-
-print('\n=== STAGE 3 : sortie stage2 -> 32x32 (via f32) ===')
-x_stage3, grads3, snaps3 = run_stage_chunked(f32, x_stage2, L_STEPS_STAGE3, fid_eval_interval=FID_EVAL_INTERVAL)
-
-
+    raise RuntimeError('Invalid STAGE0_INIT (uniform / gaussian / fft)')
+ 
+x_out, grads_out, snaps_out = run_stage_chunked(
+    nets[0], x0, L_STEPS_STAGE0, fid_eval_interval=CASCADE_FID_EVAL_INTERVAL[0])
+x_stage_outputs[0] = x_out
+grads_per_stage[0] = grads_out
+snaps_per_stage[0] = snaps_out
+ 
+for lvl in range(1, N_LEVELS):
+    res_prev = CASCADE_RESOLUTIONS[lvl - 1]
+    res_lvl = CASCADE_RESOLUTIONS[lvl]
+    steps_lvl = CASCADE_STEPS[lvl - 1]
+    print('\n=== Stage {} : {}x{} -> {}x{} (via net {}) ==='.format(lvl, res_prev, res_prev, res_lvl, res_lvl, lvl))
+ 
+    x_out, grads_out, snaps_out = run_stage_chunked(
+        nets[lvl], x_stage_outputs[lvl - 1], steps_lvl, fid_eval_interval=CASCADE_FID_EVAL_INTERVAL[lvl])
+    x_stage_outputs[lvl] = x_out
+    grads_per_stage[lvl] = grads_out
+    snaps_per_stage[lvl] = snaps_out
+ 
+ 
 # =========================
-# FID PAR RESOLUTION
+# FID PER RESOLUTION
 # =========================
-
-print('\n=== FID final par étage ===')
-fid_stage1 = compute_fid_batch(x_q8_fid, x_stage1, feature_extractor, config['data'] == 'cifar10')
-fid_stage2 = compute_fid_batch(x_q16_fid, x_stage2, feature_extractor, config['data'] == 'cifar10')
-fid_stage3 = compute_fid_batch(x_q32_fid, x_stage3, feature_extractor, config['data'] == 'cifar10')
-
-print(f'Stage 1 (8x8 blocky)   FID = {fid_stage1:.4f}')
-print(f'Stage 2 (16x16 blocky) FID = {fid_stage2:.4f}')
-print(f'Stage 3 (32x32 réel)   FID = {fid_stage3:.4f}')
-
+ 
+print('\n=== Final FID per stage ===')
+fid_per_stage = []
+for lvl in range(N_LEVELS):
+    fid_val = compute_fid_batch(x_q_fid_per_level[lvl], x_stage_outputs[lvl], feature_extractor,
+                                 config['data'] == 'cifar10')
+    fid_per_stage.append(fid_val)
+    is_final = (lvl == N_LEVELS - 1)
+    tag = 'real' if is_final else 'blocky'
+    print('{} ({}x{} {})   FID = {:.4f}'.format(STAGE_LABELS[lvl], CASCADE_RESOLUTIONS[lvl],
+                                                 CASCADE_RESOLUTIONS[lvl], tag, fid_val))
+ 
 pd.DataFrame({
-    'stage': ['8x8', '16x16', '32x32'],
-    'network': ['f', 'f16', 'f32'],
-    'FID': [fid_stage1, fid_stage2, fid_stage3],
+    'stage': list(range(N_LEVELS)),
+    'resolution': CASCADE_RESOLUTIONS,
+    'FID': fid_per_stage,
 }).to_csv(OUT_DIR + 'fid_per_stage.csv', index=False)
-
-# -------- FID intermédiaire (en fonction du pas Langevin) par étage --------
-print('\n=== FID intermédiaire — stage 1 (8x8) ===')
-steps1, fidcurve1 = fid_over_snapshots(snaps1, x_q8_fid)
-print('\n=== FID intermédiaire — stage 2 (16x16) ===')
-steps2, fidcurve2 = fid_over_snapshots(snaps2, x_q16_fid)
-print('\n=== FID intermédiaire — stage 3 (32x32) ===')
-steps3, fidcurve3 = fid_over_snapshots(snaps3, x_q32_fid)
-
-pd.DataFrame({'step': steps1, 'fid': fidcurve1}).to_csv(OUT_DIR + 'fid_vs_step_stage1_8x8.csv', index=False)
-pd.DataFrame({'step': steps2, 'fid': fidcurve2}).to_csv(OUT_DIR + 'fid_vs_step_stage2_16x16.csv', index=False)
-pd.DataFrame({'step': steps3, 'fid': fidcurve3}).to_csv(OUT_DIR + 'fid_vs_step_stage3_32x32.csv', index=False)
-
-
+ 
+# -------- intermediate FID (as a function of the Langevin step), per stage --------
+steps_per_stage = [None] * N_LEVELS
+fidcurve_per_stage = [None] * N_LEVELS
+for lvl in range(N_LEVELS):
+    print('\n=== Intermediate FID — {} ==='.format(STAGE_LABELS[lvl]))
+    steps_lvl, fidcurve_lvl = fid_over_snapshots(snaps_per_stage[lvl], x_q_fid_per_level[lvl])
+    steps_per_stage[lvl] = steps_lvl
+    fidcurve_per_stage[lvl] = fidcurve_lvl
+    res = CASCADE_RESOLUTIONS[lvl]
+    pd.DataFrame({'step': steps_lvl, 'fid': fidcurve_lvl}).to_csv(
+        OUT_DIR + 'fid_vs_step_stage{}_{}x{}.csv'.format(lvl, res, res), index=False)
+ 
+ 
 # =========================
 # PLOTS
 # =========================
-
-# -------- images générées par étage --------
-plot_ims(OUT_DIR + 'gen_stage1_8x8.png', x_stage1[:N_IMAGES_PLOT])
-plot_ims(OUT_DIR + 'gen_stage2_16x16.png', x_stage2[:N_IMAGES_PLOT])
-plot_ims(OUT_DIR + 'gen_stage3_32x32.png', x_stage3[:N_IMAGES_PLOT])
-
-# -------- images réelles de référence (mêmes résolutions) pour comparaison visuelle --------
-plot_ims(OUT_DIR + 'real_stage1_8x8.png', x_q8_fid[:N_IMAGES_PLOT])
-plot_ims(OUT_DIR + 'real_stage2_16x16.png', x_q16_fid[:N_IMAGES_PLOT])
-plot_ims(OUT_DIR + 'real_stage3_32x32.png', x_q32_fid[:N_IMAGES_PLOT])
-
-# -------- grille récapitulative : progression de la cascade pour les mêmes échantillons --------
+ 
+# -------- generated images per stage --------
+for lvl in range(N_LEVELS):
+    res = CASCADE_RESOLUTIONS[lvl]
+    plot_ims(OUT_DIR + 'gen_stage{}_{}x{}.png'.format(lvl, res, res), x_stage_outputs[lvl][:N_IMAGES_PLOT])
+ 
+# -------- real reference images (same resolutions) for visual comparison --------
+for lvl in range(N_LEVELS):
+    res = CASCADE_RESOLUTIONS[lvl]
+    plot_ims(OUT_DIR + 'real_stage{}_{}x{}.png'.format(lvl, res, res), x_q_fid_per_level[lvl][:N_IMAGES_PLOT])
+ 
+# -------- summary grid : cascade progression for the same samples --------
 n_show = min(8, N_IMAGES_PLOT)
-fig, axes = plt.subplots(3, n_show, figsize=(2 * n_show, 6))
-stage_imgs = [x_stage1, x_stage2, x_stage3]
-stage_titles = ['Stage 1 (8x8)', 'Stage 2 (16x16)', 'Stage 3 (32x32)']
-for row, (imgs, title) in enumerate(zip(stage_imgs, stage_titles)):
+fig, axes = plt.subplots(N_LEVELS, n_show, figsize=(2 * n_show, 2 * N_LEVELS))
+if N_LEVELS == 1:
+    axes = axes.reshape(1, -1)
+for row in range(N_LEVELS):
+    imgs = x_stage_outputs[row]
+    title = STAGE_LABELS[row]
     imgs_np = ((imgs[:n_show].detach().cpu().clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).numpy()
     for col in range(n_show):
         ax = axes[row, col]
@@ -465,14 +484,16 @@ for row, (imgs, title) in enumerate(zip(stage_imgs, stage_titles)):
         ax.axis('off')
         if col == 0:
             ax.set_ylabel(title, rotation=0, labelpad=40, fontsize=10)
-plt.suptitle('Progression de la cascade (mêmes échantillons à travers f -> f16 -> f32)')
+plt.suptitle('Cascade progression (same samples through {})'.format(' -> '.join(str(r) for r in CASCADE_RESOLUTIONS)))
 plt.tight_layout()
 plt.savefig(OUT_DIR + 'cascade_progression.png', dpi=150)
 plt.close()
-
-# -------- courbes gradient moyen par étage --------
-fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=False)
-for ax, grads, title in zip(axes, [grads1, grads2, grads3], stage_titles):
+ 
+# -------- mean gradient curves per stage --------
+fig, axes = plt.subplots(1, N_LEVELS, figsize=(5 * N_LEVELS, 4), sharey=False)
+if N_LEVELS == 1:
+    axes = [axes]
+for ax, grads, title in zip(axes, grads_per_stage, STAGE_LABELS):
     ax.plot(grads, color='steelblue')
     ax.set_xlabel('Langevin step')
     ax.set_ylabel('Mean gradient norm')
@@ -480,33 +501,35 @@ for ax, grads, title in zip(axes, [grads1, grads2, grads3], stage_titles):
 plt.tight_layout()
 plt.savefig(OUT_DIR + 'gradient_norm_per_stage.png', dpi=150)
 plt.close()
-
-# -------- courbe FID vs step, une couleur par étage --------
+ 
+# -------- FID vs step curve, one color per stage --------
 plt.figure(figsize=(10, 5))
-plt.plot(steps1, fidcurve1, marker='o', markersize=3, label='Stage 1 (8x8) vs réel 8x8')
-plt.plot(steps2, fidcurve2, marker='o', markersize=3, label='Stage 2 (16x16) vs réel 16x16')
-plt.plot(steps3, fidcurve3, marker='o', markersize=3, label='Stage 3 (32x32) vs réel 32x32')
-plt.xlabel('Langevin step (dans l\'étage)')
+for lvl in range(N_LEVELS):
+    res = CASCADE_RESOLUTIONS[lvl]
+    plt.plot(steps_per_stage[lvl], fidcurve_per_stage[lvl], marker='o', markersize=3,
+              label='{} vs real {}x{}'.format(STAGE_LABELS[lvl], res, res))
+plt.xlabel('Langevin step (within stage)')
 plt.ylabel('FID')
-plt.title(f'FID vs pas Langevin par étage (batch={FID_BATCH_SIZE}, init stage1={STAGE1_INIT})')
+plt.title('FID vs Langevin step per stage (batch={}, stage0 init={})'.format(FID_BATCH_SIZE, STAGE0_INIT))
 plt.legend()
 plt.tight_layout()
 plt.savefig(OUT_DIR + 'fid_vs_step_all_stages.png', dpi=150)
 plt.close()
-
-# -------- barplot FID final par résolution --------
-plt.figure(figsize=(6, 4))
-plt.bar(['8x8\n(f)', '16x16\n(f16)', '32x32\n(f32)'], [fid_stage1, fid_stage2, fid_stage3],
-        color=['steelblue', 'darkorange', 'seagreen'])
-plt.ylabel('FID final')
-plt.title('FID final par résolution de la cascade')
+ 
+# -------- final FID barplot per resolution --------
+plt.figure(figsize=(2 * N_LEVELS + 2, 4))
+bar_labels = ['{}x{}\n(net {})'.format(res, res, lvl) for lvl, res in enumerate(CASCADE_RESOLUTIONS)]
+plt.bar(bar_labels, fid_per_stage, color=plt.cm.viridis(np.linspace(0.2, 0.8, N_LEVELS)))
+plt.ylabel('Final FID')
+plt.title('Final FID per cascade resolution')
 plt.tight_layout()
 plt.savefig(OUT_DIR + 'fid_final_per_stage.png', dpi=150)
 plt.close()
-
-print(f'\nTout a été sauvegardé dans : {OUT_DIR}')
-print(f'  - gen_stage{{1,2,3}}_*.png / real_stage{{1,2,3}}_*.png : images générées/réelles par résolution')
-print(f'  - cascade_progression.png : mêmes échantillons à travers les 3 étages')
-print(f'  - fid_per_stage.csv, fid_final_per_stage.png : FID final par résolution')
-print(f'  - fid_vs_step_stage*_*.csv, fid_vs_step_all_stages.png : FID en fonction du pas Langevin')
-print(f'  - gradient_norm_per_stage.png : norme du gradient moyen par étage')
+ 
+print(f'\nEverything was saved in: {OUT_DIR}')
+print(f'  - gen_stage*_*.png / real_stage*_*.png : generated/real images per resolution')
+print(f'  - cascade_progression.png : same samples through all {N_LEVELS} stages')
+print(f'  - fid_per_stage.csv, fid_final_per_stage.png : final FID per resolution')
+print(f'  - fid_vs_step_stage*_*.csv, fid_vs_step_all_stages.png : FID as a function of the Langevin step')
+print(f'  - gradient_norm_per_stage.png : mean gradient norm per stage')
+ 

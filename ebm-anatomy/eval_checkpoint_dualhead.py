@@ -11,10 +11,6 @@ from ebm_utils import*
 from nets import *
 from utilfid import *
 
-# =========================
-# PARAMETRES (EN HAUT)
-# =========================
-
 EXP_DIR = './out_data/Expe/cifar10_Langevin10_only_negative_forebm_regul_0001/'
 
 # find any json config file in the code directory of the experiment
@@ -25,7 +21,7 @@ for file in os.listdir(EXP_DIR+'code/'):
         break
 if CONFIG_FILE is None:
     raise FileNotFoundError(f"No JSON config file found in {EXP_DIR}")
-
+# checkpoint to evaluate
 CHECKPOINT_FILE = EXP_DIR + 'checkpoints/net_099000.pth'
 CSV_FILE = EXP_DIR + 'plots/training_metrics.csv'
 FID_BATCH_SIZE = 3000
@@ -38,8 +34,6 @@ LONGRUN_INIT = 'fft'  # 'uniform', 'gaussian', or 'fft'
 FFT_NOISE_BANDS = ('low', 'mid', 'high')
 SEED = 42
 
-# Calcule le FID toutes les FID_EVAL_INTERVAL itérations Langevin.
-# Mettre à None pour désactiver (comportement original).
 FID_EVAL_INTERVAL = 100   # ex: 50, 100, 200 …
 
 
