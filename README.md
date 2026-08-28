@@ -38,31 +38,9 @@ Chaque variante d'entraînement possède un script d'évaluation associé
 (`eval_checkpoint.py`, `eval_checkpoint_coarsetofine.py`,
 `eval_checkpoint_dualhead.py`) qui recharge un checkpoint, régénère des
 échantillons par MCMC long-terme et recalcule les diagnostics.
-
 ---
 
-## 4. Diagnostics additionnels au projet
-
-Au-delà de `d_s_t` et `r_s_t` du papier original, ce dépôt ajoute :
-
-- **FID (Fréchet Inception Distance)** (`utilfid.py`) entre échantillons positifs
-  et échantillons générés, calculé périodiquement (`log_freq`) : extracteur CNN
-  dédié pour MNIST (poids pré-entraînés locaux dans fidcheckpoints), features InceptionV3 pour
-  CIFAR-10.
-- **Indice d'instabilité** (`compute_instability_index`) : coefficient de
-  variation (écart-type / moyenne absolue) de `f(x_q)` et `f(x_s_t)` sur une
-  fenêtre glissante courte (2 itérations), cette métrique n'est pas particulièrement
-  pertinente ni fondée théoriquement.
-
-Tous ces indicateurs sont tracés par `plot_diagnostics` et sauvegardés en CSV
-(`training_metrics.csv`) et dans les checkpoints complets
-(`checkpoints/last_checkpoint.pth`), qui permettent une reprise exacte de
-l'entraînement (poids, optimiseur, buffer persistant `s_t_0`, tous les
-historiques de métriques).
-
----
-
-## 5. Utilisation
+## 2. Utilisation
 
 ### Entraînement
 
