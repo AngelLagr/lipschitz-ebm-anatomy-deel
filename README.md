@@ -62,13 +62,7 @@ Chaque fichier JSON définit intégralement une expérience : jeu de données
 (`mnist`, `cifar10`, `flowers`), architecture (`net_type`, clé de
 `net_bank` dans `train_data.py`), `Lip_const` initiale, optimiseur, paramètres de
 Langevin (`epsilon`, `num_shortrun_steps`, `shortrun_init`), et fréquences de
-logging. Les fichiers nommés `mnist_Lip{K}_Langevin{L}_Seed42*.json` forment un
-balayage systématique de la constante de Lipschitz `K` et du nombre de pas de
-Langevin `L`, correspondant à l'étude paramétrique menée dans ce projet ; les
-suffixes `Monitor`, `Constrained`, `Ortho`, `ADAM` indiquent respectivement
-l'activation du monitoring de stabilité, de la mise à jour adaptative de
-`Lip_const`, de l'usage des convolutions orthogonales, et de l'optimiseur Adam à
-la place de SGD.
+logging. 
 
 ### Évaluation
 
