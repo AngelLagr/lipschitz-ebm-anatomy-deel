@@ -38,6 +38,7 @@ Chaque variante d'entraînement possède un script d'évaluation associé
 (`eval_checkpoint.py`, `eval_checkpoint_coarsetofine.py`,
 `eval_checkpoint_dualhead.py`) qui recharge un checkpoint, régénère des
 échantillons par MCMC long-terme et recalcule les diagnostics.
+
 ---
 
 ## 2. Utilisation
