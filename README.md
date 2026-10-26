@@ -11,7 +11,7 @@ Lipschitz constraints are implemented using the
 tested exactly orthogonal convolutions via
 [orthogonium](https://github.com/deel-ai/orthogonium).
 
-This repository is the code companion to the final-year internship report
+This repository is code of my final-year internship report
 *Stabilizing Energy-Based Models via the Lipschitz Constraint* (Angel Lagrange,
 PFE ANITI / DEEL team, IRT Saint Exupéry, supervisors Victor Boutin and Franck
 Mamalet, 2026), whose full report is in this repository (only in a french version). This README is only a code-oriented summary of it.
